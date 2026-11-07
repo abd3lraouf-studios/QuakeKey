@@ -1,0 +1,15 @@
+{
+    "actions": [
+        { "command": { "action": "globalSummon", "name": "_quake" }, "id": "User.globalSummon" },
+        { "command": "toggleFocusMode", "id": "User.toggleFocusMode" }
+    ],
+    "keybindings": [
+        { "id": "User.globalSummon", "keys": "f12" },
+        { "id": "User.toggleFocusMode", "keys": "shift+f12" }
+    ],
+    "profiles": {
+        "list": [
+            { "guid": "{de3eb171-ebcb-4b0c-bb7a-fdfbba34c044}", "icon": "🛡", "name": "PowerShell 7 (Admin)", "opacity": 92 }
+        ]
+    }
+}

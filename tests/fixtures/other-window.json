@@ -1,0 +1,9 @@
+{
+    "actions": [
+        { "command": { "action": "globalSummon", "name": "notes" }, "id": "User.notes" }
+    ],
+    "keybindings": [
+        { "id": "User.notes", "keys": "win+n" }
+    ],
+    "profiles": { "list": [] }
+}

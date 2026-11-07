@@ -1,0 +1,6 @@
+{
+    "keybindings": [
+        { "id": "Terminal.QuakeMode", "keys": "f12" }
+    ],
+    "profiles": { "list": [] }
+}

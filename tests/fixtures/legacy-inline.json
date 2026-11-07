@@ -1,0 +1,9 @@
+{
+    "actions": [
+        { "command": { "action": "globalSummon", "name": "_quake", "dropdownDuration": 150 }, "keys": "f12" },
+        { "command": "copy", "keys": "ctrl+c" }
+    ],
+    "profiles": [
+        { "guid": "{61c54bbd-c2c6-5271-96e7-009a87ff44bf}", "name": "Windows PowerShell" }
+    ]
+}

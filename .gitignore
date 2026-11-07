@@ -1,0 +1,8 @@
+# Build output
+bin/
+tests/out/
+*.exe
+
+# Local run state (never commit a user's settings or undo records)
+*.log
+*.log.old

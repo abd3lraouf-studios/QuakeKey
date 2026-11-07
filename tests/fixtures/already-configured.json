@@ -1,0 +1,10 @@
+{
+    "actions": [
+        { "command": { "action": "globalSummon", "dropdownDuration": 200, "monitor": "any", "name": "_quake" }, "id": "User.globalSummon" }
+    ],
+    "keybindings": [
+        { "id": "User.globalSummon", "keys": "ctrl+alt+shift+f24" },
+        { "id": null, "keys": "win+sc(41)" }
+    ],
+    "profiles": { "list": [] }
+}

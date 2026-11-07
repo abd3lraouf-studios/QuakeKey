@@ -1,0 +1,15 @@
+// Windows Terminal settings with comments and trailing commas
+{
+    /* a block comment */
+    "actions": [
+        { "command": { "action": "globalSummon", "name": "_quake" }, "id": "User.quake", }, // trailing comma in an object
+    ],
+    "keybindings": [
+        { "id": "User.quake", "keys": "f12" },
+    ],
+    "profiles": {
+        "list": [
+            { "name": "Odd // not a comment, and ,} not a trailing comma", "commandline": "cmd.exe /k echo \"//\" /*x*/", },
+        ],
+    },
+}
