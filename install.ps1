@@ -4,11 +4,13 @@
     anywhere, including over admin windows, and always gives it focus.
 
 .DESCRIPTION
-    1. Builds QuakeKey.exe from src\QuakeKey.cs with the .NET Framework compiler that ships with Windows.
-    2. After one UAC prompt: installs it to C:\Program Files\QuakeKey, creates C:\ProgramData\QuakeKey for its log,
-       registers the scheduled tasks \QuakeKey\Hotkey (elevated, at logon), \QuakeKey\StartShown and
-       \QuakeKey\StartHidden (normal privileges), and starts it.
+    1. Checks the account and machine (administrator account, UAC on, Windows Terminal 1.24+, the wt.exe alias).
+    2. Builds QuakeKey.exe from src\QuakeKey.cs with the .NET Framework compiler that ships with Windows.
     3. Updates Windows Terminal's settings.json (backup first) so Terminal itself no longer registers the hotkey.
+    4. After one UAC prompt: installs QuakeKey.exe to C:\Program Files\QuakeKey (checking it is the file just
+       built), creates C:\ProgramData\QuakeKey\<your SID> for its log, registers the scheduled tasks
+       \QuakeKey\<your SID>\Hotkey (elevated, at logon, restarted if it stops), StartShown and StartHidden (normal
+       privileges), and starts it. If this step fails or is cancelled, settings.json is put back.
 
     Run it again at any time to update or change options; the original undo information is kept.
     Remove everything with uninstall.ps1. Details: README.md.
@@ -46,6 +48,7 @@ param(
     [switch]$SkipTerminalSettings,
     [switch]$Force
 )
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'scripts\QuakeKey.Common.ps1')
 Reset-QkModulePathFor51
@@ -54,6 +57,8 @@ $paths = Get-QkPaths
 try {
     Write-QkStep 'Checking prerequisites'
     if (-not [Environment]::Is64BitOperatingSystem) { throw 'QuakeKey needs 64-bit Windows.' }
+    $problems = @(Test-QkPrerequisites (Get-QkAccountFacts))
+    if ($problems.Count) { throw ($problems -join ' ') }
     $wt = Get-AppxPackage -Name Microsoft.WindowsTerminal -ErrorAction SilentlyContinue | Sort-Object { [version]$_.Version } -Descending | Select-Object -First 1
     if (-not $wt) { throw 'Windows Terminal (the Microsoft Store / winget package) is not installed. Install it first: winget install Microsoft.WindowsTerminal' }
     if ([version]$wt.Version -lt [version]'1.24.0.0') {
@@ -68,7 +73,8 @@ try {
     Write-QkStep 'Building QuakeKey.exe'
     $exe = Join-Path $PSScriptRoot 'bin\QuakeKey.exe'
     Build-QuakeKey -Source (Join-Path $PSScriptRoot 'src\QuakeKey.cs') -OutFile $exe
-    Write-QkNote $exe
+    $exeSha256 = Get-QkSha256 -Path $exe   # the elevated step installs only this exact file
+    Write-QkNote "$exe (SHA-256 $exeSha256)"
 
     Write-QkStep 'Checking the hotkey'
     $keyInfo = Get-QkKeyInfo -Exe $exe -Key $Key
@@ -76,15 +82,25 @@ try {
     Write-QkNote "hotkey: $($keyInfo.Text)"
     if ($moveDebugger) { Write-QkNote "Windows reserves $($keyInfo.Text) for its debugger break key; the installer moves that to Scroll Lock (takes effect after a reboot)." }
 
-    # Plan the Terminal change first, so a conflict stops the install before anything is touched.
+    # Terminal settings first: a conflict stops the install before anything is touched, and Terminal lets go of the
+    # key before QuakeKey starts. The elevated step below puts them back if it fails.
     $plan = $null
-    $previous = $null
+    $settingsWrite = $null
     if (-not $SkipTerminalSettings) {
-        Write-QkStep 'Checking Windows Terminal settings'
+        Write-QkStep 'Updating Windows Terminal settings'
+        $previous = $null
         if (Test-Path -LiteralPath $paths.StateFile) { $previous = Get-Content -LiteralPath $paths.StateFile -Raw | ConvertFrom-Json }
-        $setArgs = @{ Monitor = $Monitor; Animation = $Animation; SetMonitor = $PSBoundParameters.ContainsKey('Monitor'); SetAnimation = $PSBoundParameters.ContainsKey('Animation'); PreviousState = $previous }
-        $plan = Set-QkTerminalBinding -Settings (Read-QkJsonFile $paths.TerminalSettings) @setArgs
-        if ($plan.Changes.Count) { $plan.Changes | ForEach-Object { Write-QkNote $_ } } else { Write-QkNote 'already set up for QuakeKey' }
+        $current = Read-QkJsonFile $paths.TerminalSettings
+        $shapeBefore = Get-QkSettingsShape $current
+        $plan = Set-QkTerminalBinding -Settings $current -Monitor $Monitor -Animation $Animation `
+            -SetMonitor:$PSBoundParameters.ContainsKey('Monitor') -SetAnimation:$PSBoundParameters.ContainsKey('Animation') -PreviousState $previous
+        if ($plan.Changes.Count) {
+            $plan.Changes | ForEach-Object { Write-QkNote $_ }
+            $settingsWrite = Save-QkTerminalSettings -Path $paths.TerminalSettings -Settings $plan.Settings -BackupDir $paths.BackupDir -ShapeBefore $shapeBefore
+            Write-QkNote "saved; backup of the previous file: $($settingsWrite.Backup)"
+            Write-QkNote 'comments in settings.json are not kept (they are in the backup)'
+        }
+        else { Write-QkNote 'already set up for QuakeKey' }
 
         $globals = Get-QkProp $plan.Settings 'globals'   # null on settings.json without a "globals" block
         $persisted = [string](Get-QkProp $globals 'firstWindowPreference')
@@ -97,36 +113,25 @@ try {
     Write-QkStep 'Installing (Windows asks for administrator permission once)'
     $elevatedArgs = @{
         Source          = $exe
+        SourceSha256    = $exeSha256
         Key             = $keyInfo.Text
         User            = [Security.Principal.WindowsIdentity]::GetCurrent().Name
         MoveDebuggerKey = [bool]$moveDebugger
         DebuggerBreakVk = $(if ($keyInfo.Vk -eq 0x91) { 0x13 } else { 0x91 })   # Scroll Lock, or Pause if the hotkey is Scroll Lock
     }
-    $result = Invoke-QkElevated -Mode Install -Parameters $elevatedArgs
-    $result.messages | ForEach-Object { Write-QkNote $_ }
-    if (-not $result.ok) { throw 'The elevated install step failed (see above). Windows Terminal settings were not changed.' }
+    $since = Get-Date
+    try {
+        $result = Invoke-QkElevated -Mode Install -Parameters $elevatedArgs
+        $result.messages | ForEach-Object { Write-QkNote $_ }
+        if (-not $result.ok) { throw 'The elevated install step failed (see above).' }
+    }
+    catch {
+        if ($settingsWrite) { Write-QkNote (Restore-QkSettingsBackup $settingsWrite) }
+        throw
+    }
 
-    if (-not $SkipTerminalSettings) {
-        Write-QkStep 'Updating Windows Terminal settings'
+    if ($plan) {
         New-Item -ItemType Directory -Force $paths.UserDir | Out-Null
-        # Re-read: Terminal may have saved the file while the UAC prompt was open.
-        $current = Read-QkJsonFile $paths.TerminalSettings
-        $shapeBefore = Get-QkSettingsShape $current
-        $plan = Set-QkTerminalBinding -Settings $current @setArgs
-        if ($plan.Changes.Count) {
-            New-Item -ItemType Directory -Force $paths.BackupDir | Out-Null
-            $backup = Join-Path $paths.BackupDir ('settings-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.json')
-            Copy-Item -LiteralPath $paths.TerminalSettings -Destination $backup
-            Write-QkJsonFile $paths.TerminalSettings $plan.Settings
-            $shapeAfter = Get-QkSettingsShape (Read-QkJsonFile $paths.TerminalSettings)
-            if ($shapeAfter -ne $shapeBefore) {
-                Copy-Item -LiteralPath $backup -Destination $paths.TerminalSettings -Force
-                throw "Rewriting settings.json would have changed more than its key bindings ($shapeBefore -> $shapeAfter). The original was put back."
-            }
-            Write-QkNote "saved; backup of the previous file: $backup"
-            Write-QkNote 'comments in settings.json are not kept (they are in the backup)'
-        }
-        else { Write-QkNote 'no change needed' }
         Write-QkJsonFile $paths.StateFile $plan.State   # what uninstall.ps1 undoes
     }
     else {
@@ -137,31 +142,33 @@ try {
         Write-QkNote "Remove any other globalSummon / quakeMode key, especially one on $($keyInfo.Text)."
     }
 
+    # QuakeKey retries the key every second, and Terminal lets go of it a moment after its settings change, so a
+    # first "could not be registered" is not final: wait up to 15 s for "registered".
     Write-QkStep 'Checking that QuakeKey runs'
     $log = Join-Path $paths.LogDir 'quakekey.log'
-    $since = (Get-Date).AddSeconds(-30)
-    $status = $null
-    for ($i = 0; $i -lt 20 -and -not $status; $i++) {
+    $userLog = Join-Path $paths.UserDir 'quakekey.log'   # where a non-elevated QuakeKey would log
+    $status = Get-QkStartStatus -Lines @() -Since $since
+    $deadline = (Get-Date).AddSeconds(15)
+    while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 500
-        if (-not (Test-Path -LiteralPath $log)) { continue }
-        foreach ($line in (Get-Content -LiteralPath $log -Tail 20)) {
-            if ($line.Length -lt 23) { continue }
-            $stamp = [datetime]::MinValue
-            if (-not [datetime]::TryParseExact($line.Substring(0, 23), 'yyyy-MM-dd HH:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$stamp) -or $stamp -lt $since) { continue }
-            if ($line -match ' registered$') { $status = 'ok' }
-            elseif ($line -match 'could not be registered') { $status = $line.Substring(25) }
-        }
+        $lines = @()
+        foreach ($file in $log, $userLog) { if (Test-Path -LiteralPath $file) { $lines += @(Get-Content -LiteralPath $file -Tail 50) } }
+        $status = Get-QkStartStatus -Lines $lines -Since $since
+        if ($status.State -eq 'ok' -or $status.State -eq 'stopped') { break }
     }
 
     Write-Host ''
-    if ($status -eq 'ok') {
+    if ($status.State -eq 'ok' -and $status.Elevated -eq $false) {
+        Write-Host "QuakeKey is installed but runs WITHOUT admin rights, so $($keyInfo.Text) will not work while an admin window has focus." -ForegroundColor Yellow
+    }
+    elseif ($status.State -eq 'ok') {
         Write-Host "QuakeKey is installed. Press $($keyInfo.Text) to drop down the Terminal quake window; press it again to hide it." -ForegroundColor Green
     }
     elseif ($result.rebootNeeded) {
         Write-Host "QuakeKey is installed. Reboot once: Windows frees $($keyInfo.Text) from its debugger break key at startup." -ForegroundColor Yellow
     }
-    elseif ($status) {
-        Write-Host "QuakeKey is installed but could not take the key: $status" -ForegroundColor Yellow
+    elseif ($status.State -eq 'failed' -or $status.State -eq 'stopped') {
+        Write-Host "QuakeKey is installed but could not take the key: $($status.Text)" -ForegroundColor Yellow
     }
     else {
         Write-Host "QuakeKey is installed, but its log shows no start yet. Check $log in a moment." -ForegroundColor Yellow

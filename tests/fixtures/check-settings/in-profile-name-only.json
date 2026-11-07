@@ -1,0 +1,5 @@
+{
+    "actions": [ { "command": { "action": "globalSummon", "name": "_quake" }, "id": "User.q" } ],
+    "keybindings": [ { "id": "User.q", "keys": "f12" } ],
+    "profiles": { "list": [ { "name": "my ctrl+alt+shift+f24 profile" } ] }
+}

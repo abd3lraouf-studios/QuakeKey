@@ -1,0 +1,9 @@
+{
+    "actions": [
+        { "command": "quakeMode", "id": "User.quakeMode" }
+    ],
+    "keybindings": [
+        { "id": "User.quakeMode", "keys": "f12" }
+    ],
+    "profiles": { "list": [] }
+}

@@ -1,5 +1,6 @@
-# Shared helpers for install.ps1, uninstall.ps1 and tests\Run-Tests.ps1.
-# Works in Windows PowerShell 5.1 and PowerShell 7+. Dot-source it; it defines functions and constants only.
+# Shared helpers for install.ps1, uninstall.ps1, scripts\Elevated.ps1 and tests\Run-Tests.ps1.
+# Works in Windows PowerShell 5.1 and PowerShell 7+, under Set-StrictMode -Version Latest. Dot-source it; it defines
+# functions and constants only.
 
 # Terminal's globalSummon _quake action is bound to this chord. Nobody presses it: it keeps Terminal from owning the
 # real hotkey and makes that action Terminal's only (index 0) global-summon binding. src\QuakeKey.cs uses the same chord.
@@ -7,12 +8,26 @@ $QkTerminalChord = 'ctrl+alt+shift+f24'
 $QkNewActionId = 'QuakeKey.Toggle'
 $QkWinBacktick = 'win+sc(41)'   # Terminal's default quakeMode key (Win+`)
 
+# ------------------------------------------------------------------ paths and accounts
+function Get-QkUserSid([string]$User) {
+    if (-not $User) { return [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }
+    if ($User -match '^S-1-[0-9-]+$') { return $User }
+    ([Security.Principal.NTAccount]$User).Translate([Security.Principal.SecurityIdentifier]).Value
+}
+
+# Everything QuakeKey puts on the machine for one user (default: the current one).
 function Get-QkPaths {
+    param([string]$Sid)
+    if (-not $Sid) { $Sid = Get-QkUserSid }
     $programFiles = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }   # 64-bit folder even from a 32-bit shell
     $userDir = Join-Path $env:LOCALAPPDATA 'QuakeKey'
+    $logRoot = Join-Path $env:ProgramData 'QuakeKey'
     [pscustomobject]@{
+        Sid              = $Sid
         InstallDir       = Join-Path $programFiles 'QuakeKey'
-        LogDir           = Join-Path $env:ProgramData 'QuakeKey'
+        LogRoot          = $logRoot
+        LogDir           = Join-Path $logRoot $Sid
+        TaskFolder       = "\QuakeKey\$Sid\"
         UserDir          = $userDir
         StateFile        = Join-Path $userDir 'terminal-state.json'
         BackupDir        = Join-Path $userDir 'backups'
@@ -40,8 +55,37 @@ function Reset-QkModulePathFor51 {
     }
 }
 
+# What install.ps1 needs to know about the account and the machine. whoami prints SIDs, which are not localized;
+# .NET's WindowsIdentity.Groups leaves out the deny-only Administrators group of a limited admin token.
+function Get-QkAccountFacts {
+    $sids = @(& "$env:WINDIR\System32\whoami.exe" /groups /fo csv /nh | ConvertFrom-Csv -Header Name, Type, Sid, Attributes | ForEach-Object { $_.Sid })
+    $integrity = if ($sids -contains 'S-1-16-12288' -or $sids -contains 'S-1-16-16384') { 'High' } elseif ($sids -contains 'S-1-16-8192') { 'Medium' } else { 'Other' }
+    $policy = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+    $lua = Get-ItemProperty -LiteralPath $policy -Name EnableLUA -ErrorAction SilentlyContinue
+    $filter = Get-ItemProperty -LiteralPath $policy -Name FilterAdministratorToken -ErrorAction SilentlyContinue
+    [pscustomobject]@{
+        UacEnabled               = ($null -eq $lua) -or ([int]$lua.EnableLUA -ne 0)
+        Integrity                = $integrity
+        InAdministrators         = $sids -contains 'S-1-5-32-544'
+        BuiltinAdministrator     = (Get-QkUserSid) -match '-500$'
+        BuiltinAdminApprovalMode = ($null -ne $filter) -and ([int]$filter.FilterAdministratorToken -eq 1)
+        WtAlias                  = [IO.File]::Exists((Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\wt.exe'))
+    }
+}
+
+# Problems that stop an install, from Get-QkAccountFacts. QuakeKey tells your normal Terminal from an elevated one by
+# the token's elevation, which needs UAC and a split admin token.
+function Test-QkPrerequisites($Facts) {
+    $problems = New-Object System.Collections.Generic.List[string]
+    if (-not $Facts.UacEnabled) { $problems.Add('UAC is turned off (EnableLUA = 0). With UAC off every program runs as admin, so QuakeKey cannot keep your Terminal non-admin. Turn UAC on and reboot.') }
+    if (-not $Facts.InAdministrators) { $problems.Add('This account is not an administrator. QuakeKey must run elevated to receive its key over admin windows; install it from an administrator account.') }
+    if ($Facts.BuiltinAdministrator -and -not $Facts.BuiltinAdminApprovalMode) { $problems.Add('This is the built-in Administrator account, which runs every program elevated. Use a normal administrator account.') }
+    if (-not $Facts.WtAlias) { $problems.Add('The wt.exe app execution alias is off. Turn on "Terminal" under Settings > Apps > Advanced app settings > App execution aliases.') }
+    $problems.ToArray()   # unrolled: callers collect it with @()
+}
+
 function Get-QkProp($Object, [string]$Name) {
-    if ($null -eq $Object -or $Object -is [string]) { return $null }
+    if ($null -eq $Object -or $Object -is [string] -or $Object -is [ValueType]) { return $null }
     $p = $Object.PSObject.Properties[$Name]
     if ($p) { return $p.Value }
     return $null
@@ -68,6 +112,14 @@ function ConvertTo-QkList($Value) {
     , $list
 }
 
+function Get-QkSha256 {
+    param([byte[]]$Bytes, [string]$Path)
+    if ($Path) { $Bytes = [IO.File]::ReadAllBytes($Path) }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { -join ($sha.ComputeHash($Bytes) | ForEach-Object { $_.ToString('X2') }) }
+    finally { $sha.Dispose() }
+}
+
 # ------------------------------------------------------------------ build / run
 function Build-QuakeKey {
     param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$OutFile)
@@ -75,10 +127,21 @@ function Build-QuakeKey {
     if (-not (Test-Path -LiteralPath $csc)) { throw "The .NET Framework 4 compiler was not found at $csc." }
     New-Item -ItemType Directory -Force (Split-Path $OutFile) | Out-Null
     $manifest = Join-Path (Split-Path $Source) 'app.manifest'
-    $args = @('/nologo', '/target:winexe', '/platform:anycpu', '/optimize+', "/out:$OutFile")
-    if (Test-Path -LiteralPath $manifest) { $args += "/win32manifest:$manifest" }
-    $output = & $csc @args $Source 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "Compiling $Source failed:`n$($output -join "`n")" }
+    $cscArgs = @('/nologo', '/target:winexe', '/platform:anycpu', '/optimize+', '/codepage:65001', "/out:$OutFile")
+    if (Test-Path -LiteralPath $manifest) { $cscArgs += "/win32manifest:$manifest" }
+    # A freshly written exe can be held for a moment (an antivirus scan, a test that just ran it): csc then fails with
+    # CS0016 "could not write to output file". That one error is retried; any other fails at once.
+    for ($attempt = 1; ; $attempt++) {
+        $output = @(& $csc @cscArgs $Source 2>&1)
+        if ($LASTEXITCODE -eq 0) { return }
+        if ($attempt -ge 5 -or -not ($output -match 'CS0016')) { throw "Compiling $Source failed:`n$($output -join "`n")" }
+        Start-Sleep -Milliseconds (500 * $attempt)
+    }
+}
+
+# One command-line argument, quoted the way CommandLineToArgvW / the C runtime read it back.
+function ConvertTo-QkArgument([string]$Value) {
+    '"' + (($Value -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1') + '"'
 }
 
 # Runs QuakeKey.exe (a GUI-subsystem exe, so PowerShell would not wait for it) and captures its output.
@@ -86,16 +149,16 @@ function Invoke-QkExe {
     param([Parameter(Mandatory)][string]$Exe, [string[]]$Arguments)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $Exe
-    $psi.Arguments = (@($Arguments) | ForEach-Object { '"' + $_ + '"' }) -join ' '
+    $psi.Arguments = (@($Arguments) | ForEach-Object { ConvertTo-QkArgument $_ }) -join ' '
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
     $p = [System.Diagnostics.Process]::Start($psi)
-    $out = $p.StandardOutput.ReadToEnd()
-    $err = $p.StandardError.ReadToEnd()
+    $out = $p.StandardOutput.ReadToEndAsync()   # both at once: reading one to the end first can deadlock on the other
+    $err = $p.StandardError.ReadToEndAsync()
     $p.WaitForExit()
-    [pscustomobject]@{ ExitCode = $p.ExitCode; Out = $out.Trim(); Err = $err.Trim() }
+    [pscustomobject]@{ ExitCode = $p.ExitCode; Out = $out.Result.Trim(); Err = $err.Result.Trim() }
 }
 
 # Parses `QuakeKey.exe --validate-key` output: "<text> vk=0xNN mods=0xN".
@@ -107,18 +170,46 @@ function Get-QkKeyInfo {
     [pscustomobject]@{ Text = $Matches.text; Vk = [Convert]::ToInt32($Matches.vk, 16); Mods = [Convert]::ToInt32($Matches.mods, 16) }
 }
 
-# Windows keeps the debugger break key (HKLM ...\AeDebug UserDebuggerHotKey, 0 = F12) registered all the time, so a plain
-# F12 global hotkey fails until it is moved. Returns the virtual-key code it currently uses.
-function Get-QkDebuggerBreakVk {
+# ------------------------------------------------------------------ the debugger break key
+# Windows keeps the debugger break key (HKLM ...\AeDebug UserDebuggerHotKey, absent or 0 = F12) registered all the
+# time, so a plain F12 global hotkey fails until it is moved.
+$QkAeDebugKey = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\AeDebug'
+
+# The raw UserDebuggerHotKey value, or $null when it is not set.
+function Get-QkDebuggerKeyValue {
     $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
     try {
-        $k = $base.OpenSubKey('SOFTWARE\Microsoft\Windows NT\CurrentVersion\AeDebug')
-        $v = if ($k) { $k.GetValue('UserDebuggerHotKey', 0) } else { 0 }
-        if ($k) { $k.Close() }
-        if ([int]$v -eq 0) { return 0x7B }
-        return [int]$v
+        $k = $base.OpenSubKey($QkAeDebugKey)
+        if (-not $k) { return $null }
+        try {
+            $v = $k.GetValue('UserDebuggerHotKey', $null)
+            if ($null -eq $v) { return $null }
+            return [int]$v
+        }
+        finally { $k.Close() }
     }
     finally { $base.Close() }
+}
+
+# Sets UserDebuggerHotKey, or removes it when $Value is $null. Needs admin rights; takes effect after a reboot.
+function Set-QkDebuggerKeyValue($Value) {
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $k = $base.CreateSubKey($QkAeDebugKey)
+        try {
+            if ($null -eq $Value) { $k.DeleteValue('UserDebuggerHotKey', $false) }
+            else { $k.SetValue('UserDebuggerHotKey', [int]$Value, [Microsoft.Win32.RegistryValueKind]::DWord) }
+        }
+        finally { $k.Close() }
+    }
+    finally { $base.Close() }
+}
+
+# The virtual-key code the debugger break key currently uses.
+function Get-QkDebuggerBreakVk {
+    $v = Get-QkDebuggerKeyValue
+    if ($null -eq $v -or $v -eq 0) { return 0x7B }
+    return $v
 }
 
 function Test-QkKeyNeedsDebuggerMove($KeyInfo) {
@@ -180,15 +271,75 @@ function Read-QkJsonFile([string]$Path) {
     ConvertFrom-QkJsonC -Text ([System.IO.File]::ReadAllText($Path))
 }
 
-# Writes UTF-8 without BOM via a temp file, re-parses it, then replaces the target in one step.
+# ------------------------------------------------------------------ files and links
+function Test-QkPathExists([string]$Path) {
+    try { $null = [IO.File]::GetAttributes($Path); $true } catch { $false }   # also true for a dangling link
+}
+
+function Test-QkLink([string]$Path) {
+    ([IO.File]::GetAttributes($Path) -band [IO.FileAttributes]::ReparsePoint) -ne 0
+}
+
+# Deletes a symlink or junction itself, never what it points to.
+function Remove-QkLink([string]$Path) {
+    if ([IO.File]::GetAttributes($Path) -band [IO.FileAttributes]::Directory) { [IO.Directory]::Delete($Path) }
+    else { [IO.File]::Delete($Path) }
+}
+
+# Recursive delete that never follows links. (Windows PowerShell 5.1's Remove-Item -Recurse can walk into a junction
+# and delete what it points to.) A hard-linked file only loses this name.
+function Remove-QkTreeSafely([string]$Path) {
+    $attributes = [IO.File]::GetAttributes($Path)
+    if ($attributes -band [IO.FileAttributes]::ReparsePoint) { Remove-QkLink $Path; return }
+    if ($attributes -band [IO.FileAttributes]::Directory) {
+        foreach ($entry in [IO.Directory]::GetFileSystemEntries($Path)) { Remove-QkTreeSafely $entry }
+        [IO.Directory]::Delete($Path)
+    }
+    else { [IO.File]::Delete($Path) }
+}
+
+# The file a path finally names, following symbolic links (dotfiles setups link settings.json elsewhere).
+function Resolve-QkFinalPath([string]$Path) {
+    $current = [IO.Path]::GetFullPath($Path)
+    for ($hop = 0; $hop -lt 16; $hop++) {
+        if (-not (Test-QkPathExists $current)) { return $current }
+        $item = Get-Item -LiteralPath $current -Force
+        if ($item.LinkType -ne 'SymbolicLink') { return $current }
+        $target = @($item.Target)[0]
+        if (-not $target) { return $current }
+        if (-not [IO.Path]::IsPathRooted($target)) { $target = Join-Path (Split-Path $current) $target }
+        $current = [IO.Path]::GetFullPath($target)
+    }
+    throw "Too many symbolic links at $Path."
+}
+
+# Replaces a file's contents. Through a symbolic link the link's target is written, and a hard-linked file is
+# rewritten in place, so links stay intact; otherwise a temp file next to it replaces it in one step.
+function Write-QkFileBytes([string]$Path, [byte[]]$Bytes) {
+    $target = Resolve-QkFinalPath $Path
+    if ([IO.File]::Exists($target) -and (Get-Item -LiteralPath $target -Force).LinkType -eq 'HardLink') {
+        [IO.File]::WriteAllBytes($target, $Bytes)
+        return
+    }
+    $tmp = "$target.quakekey-tmp"
+    try {
+        [IO.File]::WriteAllBytes($tmp, $Bytes)
+        # [NullString]::Value, not $null: PowerShell passes $null to a .NET string parameter as "", and File.Replace
+        # rejects an empty backup path (tests: "Write-QkJsonFile over an existing file").
+        if ([IO.File]::Exists($target)) { [IO.File]::Replace($tmp, $target, [NullString]::Value) }
+        else { [IO.File]::Move($tmp, $target) }
+    }
+    finally {
+        if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) }
+    }
+}
+
+# Writes UTF-8 without BOM, after checking the text parses back.
 function Write-QkJsonFile([string]$Path, $Object) {
     $json = $Object | ConvertTo-Json -Depth 64
-    $tmp = "$Path.quakekey-tmp"
-    [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding $false))
-    try { $null = ConvertFrom-QkJsonC -Text ([System.IO.File]::ReadAllText($tmp)) }
-    catch { Remove-Item -LiteralPath $tmp -Force; throw "The new $Path did not parse back: $($_.Exception.Message)" }
-    if (Test-Path -LiteralPath $Path) { [System.IO.File]::Replace($tmp, $Path, $null) }
-    else { [System.IO.File]::Move($tmp, $Path) }
+    try { $null = ConvertFrom-QkJsonC -Text $json }
+    catch { throw "The new $Path would not parse back: $($_.Exception.Message)" }
+    Write-QkFileBytes $Path ((New-Object System.Text.UTF8Encoding $false).GetBytes($json))
 }
 
 # ------------------------------------------------------------------ Windows Terminal key bindings
@@ -408,7 +559,7 @@ function Set-QkTerminalBinding {
     foreach ($b in $bindings.ToArray()) {
         $keys = Get-QkKeyList (Get-QkProp $b 'keys')
         if (-not ($keys | Where-Object { (ConvertTo-QkChord $_) -eq $QkTerminalChord })) { continue }
-        if ((Get-QkProp $b 'id') -eq $actionId -and $keys.Count -eq 1) { $hasOurs = $true; continue }
+        if ((Get-QkProp $b 'id') -eq $actionId -and @($keys).Count -eq 1) { $hasOurs = $true; continue }
         [void]$bindings.Remove($b)
         $state.removedKeybindings += [pscustomobject][ordered]@{ id = (Get-QkProp $b 'id'); keys = (Get-QkProp $b 'keys') }
         $changes.Add("removed another binding that used $QkTerminalChord")
@@ -495,6 +646,213 @@ function Get-QkSettingsShape($Settings) {
         (ConvertTo-QkList (Get-QkProp $Settings 'themes')).Count, @($Settings.PSObject.Properties | Where-Object { $_.Name -ne 'actions' -and $_.Name -ne 'keybindings' }).Count
 }
 
+# Writes new settings.json content with a backup first, and checks the result kept everything but key bindings.
+# Returns the record Restore-QkSettingsBackup needs.
+function Save-QkTerminalSettings {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Settings, [Parameter(Mandatory)][string]$BackupDir, [Parameter(Mandatory)][string]$ShapeBefore, [string]$Suffix = '')
+    New-Item -ItemType Directory -Force $BackupDir | Out-Null
+    $backup = Join-Path $BackupDir ('settings-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + $Suffix + '.json')
+    [IO.File]::WriteAllBytes($backup, [IO.File]::ReadAllBytes((Resolve-QkFinalPath $Path)))
+    Write-QkJsonFile $Path $Settings
+    $shapeAfter = Get-QkSettingsShape (Read-QkJsonFile $Path)
+    if ($shapeAfter -ne $ShapeBefore) {
+        Write-QkFileBytes $Path ([IO.File]::ReadAllBytes($backup))
+        throw "Rewriting settings.json would have changed more than its key bindings ($ShapeBefore -> $shapeAfter). The original was put back."
+    }
+    [pscustomobject]@{ Path = $Path; Backup = $backup; WrittenSha256 = (Get-QkSha256 -Path (Resolve-QkFinalPath $Path)) }
+}
+
+# Puts settings.json back from Save-QkTerminalSettings' backup, unless something changed the file since.
+function Restore-QkSettingsBackup($Record) {
+    if ((Get-QkSha256 -Path (Resolve-QkFinalPath $Record.Path)) -ne $Record.WrittenSha256) {
+        return "settings.json changed since the installer wrote it, so it was left as it is; the version before the install is $($Record.Backup)"
+    }
+    Write-QkFileBytes $Record.Path ([IO.File]::ReadAllBytes($Record.Backup))
+    "put settings.json back as it was (backup: $($Record.Backup))"
+}
+
+# ------------------------------------------------------------------ install checks
+# The newest QuakeKey start in log lines written since $Since: State none | started | ok | failed | stopped.
+function Get-QkStartStatus {
+    param([AllowEmptyCollection()][string[]]$Lines, [datetime]$Since)
+    $state = 'none'; $elevated = $null; $text = $null
+    foreach ($line in @($Lines)) {
+        if ($null -eq $line -or $line.Length -lt 26) { continue }
+        $stamp = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact($line.Substring(0, 23), 'yyyy-MM-dd HH:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$stamp)) { continue }
+        if ($stamp -lt $Since) { continue }
+        $msg = $line.Substring(25)
+        if ($msg -match '^started, pid \d+, key \S+, (?<how>.+)$') { $state = 'started'; $elevated = $Matches.how -eq 'elevated'; $text = $msg }
+        elseif ($msg -match ' registered$') { $state = 'ok'; $text = $msg }
+        elseif ($msg -match ' could not be registered ') { $state = 'failed'; $text = $msg }
+        elseif ($msg -match '^(not starting elevated|bad --key|unknown arguments|FATAL|could not open|the single-instance lock|another QuakeKey)') { $state = 'stopped'; $text = $msg }
+    }
+    [pscustomobject]@{ State = $state; Elevated = $elevated; Text = $text }
+}
+
+# ------------------------------------------------------------------ elevated-side helpers (scripts\Elevated.ps1)
+if (-not ('QuakeKeyNative' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class QuakeKeyNative
+{
+    [StructLayout(LayoutKind.Sequential)]
+    struct SECURITY_ATTRIBUTES { public int nLength; public IntPtr lpSecurityDescriptor; public bool bInheritHandle; }
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string sddl, uint revision, out IntPtr sd, IntPtr size);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool CreateDirectoryW(string path, ref SECURITY_ATTRIBUTES sa);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr LocalFree(IntPtr h);
+
+    // Creates a new directory with exactly this security descriptor, in one step; fails if the path exists.
+    public static void CreateDirectory(string path, string sddl)
+    {
+        IntPtr sd;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, out sd, IntPtr.Zero)) throw new Win32Exception();
+        try
+        {
+            var sa = new SECURITY_ATTRIBUTES { nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)), lpSecurityDescriptor = sd };
+            if (!CreateDirectoryW(path, ref sa)) throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not create " + path);
+        }
+        finally { LocalFree(sd); }
+    }
+}
+'@
+}
+
+# DACLs of the log folders. Root: SYSTEM and Administrators full control, Users may list it. Per-user folder:
+# SYSTEM and Administrators full control, that user read. Protected (P): nothing inherited from ProgramData, where
+# every user may create files. $Admin (owner and full control) is BA, Administrators, in real use; the tests pass
+# their own SID when they do not run elevated, because only an admin token can act as Administrators.
+function New-QkLogSddl {
+    param([string]$Admin = 'BA', [string]$ReaderSid, [switch]$Root)
+    $read = '0x1200a9'   # FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
+    if ($Root) { return "O:${Admin}G:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;$Admin)(A;;$read;;;BU)" }
+    "O:${Admin}G:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;$Admin)(A;OICI;$read;;;$ReaderSid)"
+}
+
+function Get-QkAclSignature($Security) {
+    $owner = $Security.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    $rules = @($Security.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | ForEach-Object {
+            '{0}|{1}|{2}|{3}|{4}|{5}' -f $_.IdentityReference.Value, [int]$_.FileSystemRights, [int]$_.InheritanceFlags, [int]$_.PropagationFlags, $_.AccessControlType, $_.IsInherited
+        } | Sort-Object)
+    "owner=$owner protected=$($Security.AreAccessRulesProtected) " + ($rules -join ';')
+}
+
+# True when a directory's owner and DACL are exactly the SDDL's: no extra, missing or inherited entries.
+function Test-QkAclMatches([string]$Path, [string]$Sddl) {
+    $expected = New-Object System.Security.AccessControl.DirectorySecurity
+    $expected.SetSecurityDescriptorSddlForm($Sddl)
+    (Get-QkAclSignature (Get-Acl -LiteralPath $Path)) -eq (Get-QkAclSignature $expected)
+}
+
+# Prepares %ProgramData%\QuakeKey\<user SID> for the elevated QuakeKey's log. ProgramData lets every user create
+# folders, so a root this version did not create (wrong owner or DACL) is moved aside, never re-permissioned: a
+# re-ACL keeps entries it does not name and handles opened before it. New folders get their DACL at creation.
+# The user's folder is always recreated empty. Returns messages.
+function Initialize-QkLogFolders {
+    param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Sid, [string]$Admin = 'BA')
+    $messages = New-Object System.Collections.Generic.List[string]
+    $rootSddl = New-QkLogSddl -Admin $Admin -Root
+    $userSddl = New-QkLogSddl -Admin $Admin -ReaderSid $Sid
+    if (Test-QkPathExists $Root) {
+        if (Test-QkLink $Root) { Remove-QkLink $Root; $messages.Add("removed a link that sat at $Root") }
+        elseif (-not [IO.Directory]::Exists($Root)) { [IO.File]::Delete($Root); $messages.Add("removed a file that sat at $Root") }
+        elseif (-not (Test-QkAclMatches $Root $rootSddl)) {
+            $aside = "$Root.old-" + (Get-Date -Format 'yyyyMMdd-HHmmss')
+            try { [IO.Directory]::Move($Root, $aside) }
+            catch { throw "$Root has permissions this installer did not set, and it could not be moved aside ($($_.Exception.Message)). Close programs using it, or delete it, and run the installer again." }
+            $messages.Add("moved the previous $Root (permissions not set by this version) to $aside")
+        }
+    }
+    if (-not [IO.Directory]::Exists($Root)) { [QuakeKeyNative]::CreateDirectory($Root, $rootSddl) }
+    foreach ($entry in [IO.Directory]::GetFileSystemEntries($Root)) {
+        # Only per-user folders belong here.
+        if ((Test-QkLink $entry) -or -not [IO.Directory]::Exists($entry) -or (Split-Path -Leaf $entry) -notmatch '^S-1-[0-9-]+$') {
+            Remove-QkTreeSafely $entry
+            $messages.Add("removed $entry")
+        }
+    }
+    $dir = Join-Path $Root $Sid
+    if (Test-QkPathExists $dir) { Remove-QkTreeSafely $dir }
+    [QuakeKeyNative]::CreateDirectory($dir, $userSddl)
+    if (-not (Test-QkAclMatches $Root $rootSddl)) { throw "$Root does not have the expected permissions after setup." }
+    if (-not (Test-QkAclMatches $dir $userSddl)) { throw "$dir does not have the expected permissions after setup." }
+    , $messages.ToArray()
+}
+
+# Copies the built exe into place after checking it is the file install.ps1 built (its SHA-256 was taken before the
+# UAC prompt). The bytes are read once, so what is checked is what is written. A running exe (another user's
+# QuakeKey) cannot be overwritten but can be renamed, so the old copy is moved aside first.
+function Copy-QkVerifiedFile {
+    param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$Destination, [Parameter(Mandatory)][string]$Sha256)
+    $bytes = [IO.File]::ReadAllBytes($Source)
+    $actual = Get-QkSha256 -Bytes $bytes
+    if ($actual -ne $Sha256.ToUpperInvariant()) { throw "$Source changed after it was built (SHA-256 $actual, expected $($Sha256.ToUpperInvariant())). Nothing was installed." }
+    $dir = Split-Path $Destination
+    $leaf = Split-Path -Leaf $Destination
+    foreach ($old in [IO.Directory]::GetFiles($dir, "$leaf.old-*")) { try { [IO.File]::Delete($old) } catch { Write-Verbose "$old is still in use; removed by a later install" } }
+    if ([IO.File]::Exists($Destination) -and (Get-QkSha256 -Path $Destination) -eq $actual) { return 'unchanged' }
+    $new = "$Destination.new"
+    if ([IO.File]::Exists($new)) { [IO.File]::Delete($new) }
+    [IO.File]::WriteAllBytes($new, $bytes)
+    if (-not [IO.File]::Exists($Destination)) { [IO.File]::Move($new, $Destination); return 'installed' }
+    $aside = "$Destination.old-" + [DateTime]::UtcNow.Ticks
+    [IO.File]::Move($Destination, $aside)
+    try { [IO.File]::Move($new, $Destination) }
+    catch { [IO.File]::Move($aside, $Destination); throw }
+    try { [IO.File]::Delete($aside); return 'replaced' } catch { return 'replaced (the previous copy is still running; it is removed on the next install)' }
+}
+
+# Task Scheduler's "restart on failure" only covers a task that fails to launch, not a program that exits with an
+# error code or crashes (tests\manual\Prove-RestartOnFailure.ps1). A trigger that repeats every $Interval, with
+# MultipleInstances IgnoreNew, restarts QuakeKey instead: while it runs the repeats are ignored, and at most one
+# interval after it stops it runs again (tests\manual\Prove-Supervisor.ps1).
+function New-QkSupervisorTrigger([TimeSpan]$Interval) {
+    New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval $Interval
+}
+
+# The three tasks of one user, as Register-ScheduledTask arguments.
+function New-QkTaskDefinitions {
+    param(
+        [Parameter(Mandatory)][string]$Exe,
+        [Parameter(Mandatory)][string]$Key,
+        [Parameter(Mandatory)][string]$User,
+        [Parameter(Mandatory)][string]$WorkingDirectory,
+        [TimeSpan]$SupervisorInterval = (New-TimeSpan -Minutes 5)
+    )
+    $common = @{ AllowStartIfOnBatteries = $true; DontStopIfGoingOnBatteries = $true; Priority = 4 }   # 4 = normal (default 7 is below normal)
+    $hotkeySettings = New-ScheduledTaskSettingsSet @common -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable
+    $launchSettings = New-ScheduledTaskSettingsSet @common -ExecutionTimeLimit (New-TimeSpan -Minutes 1) -MultipleInstances Parallel
+    $definitions = [ordered]@{}
+    $definitions['Hotkey'] = @{
+        Action      = New-ScheduledTaskAction -Execute $Exe -Argument ('--key "' + $Key + '"') -WorkingDirectory $WorkingDirectory
+        Trigger     = @((New-ScheduledTaskTrigger -AtLogOn -User $User), (New-QkSupervisorTrigger $SupervisorInterval))
+        Principal   = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Highest
+        Settings    = $hotkeySettings
+        Description = "QuakeKey: $Key toggles the Windows Terminal quake window. Runs elevated at logon; the repeating trigger restarts it if it stops (https://github.com/abd3lraouf-studios/QuakeKey)."
+    }
+    foreach ($which in 'Shown', 'Hidden') {
+        $definitions["Start$which"] = @{
+            Action      = New-ScheduledTaskAction -Execute $Exe -Argument "--start $($which.ToLowerInvariant())" -WorkingDirectory $WorkingDirectory
+            Principal   = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Limited
+            Settings    = $launchSettings
+            Description = "QuakeKey: starts Windows Terminal ($($which.ToLowerInvariant())) without admin rights."
+        }
+    }
+    $definitions
+}
+
+# SIDs of the users with a QuakeKey task folder (\QuakeKey\<SID>\).
+function Get-QkInstalledUserSids {
+    @(Get-ScheduledTask -TaskPath '\QuakeKey\*' -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.TaskPath -match '^\\QuakeKey\\(S-1-[0-9-]+)\\$') { $Matches[1] }
+        } | Sort-Object -Unique)
+}
+
 # Runs scripts\Elevated.ps1 elevated (one UAC prompt) and returns its result object.
 function Invoke-QkElevated {
     param([Parameter(Mandatory)][ValidateSet('Install', 'Uninstall')][string]$Mode, [hashtable]$Parameters = @{})
@@ -502,11 +860,11 @@ function Invoke-QkElevated {
     New-Item -ItemType Directory -Force $paths.UserDir | Out-Null
     $resultFile = Join-Path $paths.UserDir ('elevated-' + [guid]::NewGuid().ToString('N') + '.json')
     $script = Join-Path $PSScriptRoot 'Elevated.ps1'
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $script + '"'), '-Mode', $Mode, '-ResultFile', ('"' + $resultFile + '"'))
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (ConvertTo-QkArgument $script), '-Mode', $Mode, '-ResultFile', (ConvertTo-QkArgument $resultFile))
     foreach ($k in $Parameters.Keys) {
         $v = $Parameters[$k]
         if ($v -is [bool] -or $v -is [switch]) { if ($v) { $argList += "-$k" } }
-        elseif ($null -ne $v) { $argList += "-$k"; $argList += ('"' + [string]$v + '"') }
+        elseif ($null -ne $v) { $argList += "-$k"; $argList += (ConvertTo-QkArgument ([string]$v)) }
     }
     $shell = (Get-Process -Id $PID).Path
     try { $p = Start-Process -FilePath $shell -ArgumentList ($argList -join ' ') -Verb RunAs -WindowStyle Hidden -PassThru -Wait }
