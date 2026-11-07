@@ -41,7 +41,9 @@ function Test-QkTaskOwner($Task, [string]$Sid) {
 function Stop-QkUserProcesses([string]$Sid) {
     $stopped = 0
     foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='QuakeKey.exe'")) {
-        $owner = Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid
+        # A process that is exiting (the task stop just above) can still be listed and then fail GetOwnerSid.
+        try { $owner = Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid }
+        catch { Write-Verbose "process $($p.ProcessId) exited while being checked"; continue }
         if ($owner.Sid -eq $Sid) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue; $stopped++ }
     }
     $stopped
