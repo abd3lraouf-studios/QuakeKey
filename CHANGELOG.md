@@ -51,7 +51,7 @@ Fixes from a full audit of 1.0. Each fix has a test in `tests/Run-Tests.ps1` or 
 - The runtime-hook tripwire covers every `COR_*` and `COMPlus_*` variable, and SECURITY.md explains plainly what
   it can and cannot do.
 - New `QuakeKey.exe --check-settings <path>` checks a `settings.json` the way the crash guard does.
-- Tests: 77 checks became 255, including Win32 constants against the SDK, the watchdog on a fake clock, the
+- Tests: 77 checks became 255 (265 on CI, which also runs the elevated install and uninstall), including Win32 constants against the SDK, the watchdog on a fake clock, the
   log-folder ACLs, links, and a real elevated install and uninstall on CI. CI adds PSScriptAnalyzer, pins
   `actions/checkout` to a commit and runs with read-only permissions.
 
