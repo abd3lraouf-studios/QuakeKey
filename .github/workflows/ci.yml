@@ -6,13 +6,18 @@ on:
   pull_request:
 
 jobs:
-  tests:
+  tests-windows-powershell:
     runs-on: windows-latest
-    strategy:
-      matrix:
-        shell: [powershell, pwsh]
     steps:
       - uses: actions/checkout@v4
-      - name: Run tests (${{ matrix.shell }})
-        shell: ${{ matrix.shell }}
+      - name: Run tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\Run-Tests.ps1
+
+  tests-powershell-7:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests (PowerShell 7)
+        shell: pwsh
         run: .\tests\Run-Tests.ps1
