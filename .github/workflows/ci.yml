@@ -10,9 +10,9 @@ jobs:
     runs-on: windows-latest
     strategy:
       matrix:
-        shell: [Windows PowerShell, PowerShell]
+        shell: [powershell, pwsh]
     steps:
       - uses: actions/checkout@v4
       - name: Run tests (${{ matrix.shell }})
-        shell: ${{ matrix.shell == 'PowerShell' && 'pwsh' || 'powershell' }}
+        shell: ${{ matrix.shell }}
         run: .\tests\Run-Tests.ps1
