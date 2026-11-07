@@ -1,37 +1,43 @@
-// QuakeKey: owns F12 and drives the Windows Terminal quake window so it always opens focused.
+// QuakeKey: owns a global hotkey (F12 by default) and drives the Windows Terminal quake window so it always opens
+// focused, including over admin windows.
 //
-// Why it exists (checked against the Windows Terminal 1.24 source, WindowEmperor.cpp + IslandWindow.cpp):
-//  * Every Terminal process, the normal one AND the elevated PixelBee one, calls RegisterHotKey for its
-//    global-summon keys at start and again on every settings.json reload. The first caller wins, so F12
-//    could land in the admin instance, or be lost after a reload.
+// Why it exists (Windows Terminal 1.24, microsoft/terminal @ 7ff11ee; docs/how-it-works.md links the exact lines):
+//  * Every Terminal process, normal or elevated, calls RegisterHotKey for its global-summon keys at start and again
+//    on every settings.json reload (WindowEmperor::_setupGlobalHotkeys). The first caller wins, so the key could land
+//    in an elevated Terminal, or be lost after a reload.
 //  * When the quake window is on screen but not focused, Terminal's _globalActivateWindow never calls
 //    SetForegroundWindow. It AttachThreadInput()s to the focused window's thread, and that fails with
-//    ERROR_ACCESS_DENIED when the focused window is elevated (UIPI). F12 then does nothing until a click
-//    on the desktop hands focus to a normal window.
-//  * Windows does not deliver a hotkey to a normal-privilege program while an elevated window has focus
-//    (UIPI). Seen 2026-11-07: with the elevated MW4 toolkit or PixelBee focused, F12 never arrived. So this
-//    program runs elevated (task \Elevated\QuakeKey, exe in Program Files), and it never starts Terminal
-//    itself: it runs the normal-privilege tasks \QuakeKey\StartShown / \QuakeKey\StartHidden, which call
+//    ERROR_ACCESS_DENIED when the focused window is elevated (UIPI).
+//  * Windows does not deliver a hotkey to a normal-privilege program while an elevated window has focus (UIPI).
+//    So this program runs elevated (task \QuakeKey\<user SID>\Hotkey, exe in Program Files), and it never starts
+//    Terminal itself: it runs the normal-privilege tasks StartShown / StartHidden in the same task folder, which call
 //    `QuakeKey.exe --start shown|hidden`, so the quake shell stays non-admin.
 //
 // What it does:
-//  * Registers F12 itself. No Terminal binds F12 any more: Terminal's "globalSummon _quake" action sits on
-//    the unpressable ctrl+alt+shift+f24 and is its only global-summon binding, so it is hotkey index 0.
-//  * On F12 it gives the non-elevated Terminal foreground rights and sends WM_HOTKEY(0) to its message
-//    window, so Terminal runs its own toggle (show / hide / follow the mouse to another monitor).
-//  * If the quake window should now be focused but is not, it focuses it itself: AttachThreadInput to the
-//    focused window's thread (works over admin windows because this process is elevated), SetForegroundWindow,
-//    then SwitchToThisWindow.
-//  * Keeps a non-elevated Terminal running. With none, it starts `wt -Embedding` (windowless; the first F12
-//    creates the quake window in that warm process). F12 with no Terminal at all starts `wt -w _quake`.
-//  * Never sends the toggle unless a Terminal holds ctrl+alt+shift+f24 (see TerminalBindingPresent).
+//  * Registers the hotkey itself. Terminal's "globalSummon _quake" action sits on the unpressable
+//    ctrl+alt+shift+f24 and is its only global-summon binding, so it is Terminal's hotkey index 0.
+//  * On a press it gives the non-elevated Terminal foreground rights and sends WM_HOTKEY(0) to its window, so
+//    Terminal runs its own toggle (show / hide / follow the mouse to another monitor).
+//  * If the quake window should now be focused but is not, it focuses it itself: AttachThreadInput to the focused
+//    window's thread (works over admin windows because this process is elevated), SetForegroundWindow, then
+//    SwitchToThisWindow.
+//  * Keeps a non-elevated Terminal running. With none, it starts `wt -Embedding` (windowless; the first press
+//    creates the quake window in that warm process). A press with no Terminal at all starts `wt -w _quake`.
+//  * Never sends the toggle unless settings.json binds ctrl+alt+shift+f24 to the quake summon and a Terminal holds
+//    that chord (SafeToSendToggle): Terminal crashes on WM_HOTKEY(0) when it has no global-summon binding.
 //
-// Build/install: install.ps1 next to this file. Log: %LOCALAPPDATA%\QuakeKey\quakekey.log
+// Install: install.ps1. Log: %ProgramData%\QuakeKey\<user SID>\quakekey.log when elevated, %LOCALAPPDATA%\QuakeKey
+// otherwise. Pure logic (key specs, settings check, watchdog policy) lives in Logic / JsonC / WatchdogPolicy below
+// so tests\Run-Tests.ps1 can call it through reflection.
 using System;
+using System.Collections;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -39,13 +45,14 @@ using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("QuakeKey")]
 [assembly: System.Reflection.AssemblyDescription("Reliable global hotkey for the Windows Terminal quake window")]
-[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.1.0.0")]
 
 internal static class QuakeKey
 {
     // ---------------------------------------------------------------- Win32
-    const uint WM_HOTKEY = 0x0312, WM_TIMER = 0x0113, WM_QUERYENDSESSION = 0x0011, WM_ENDSESSION = 0x0016, WM_CLOSE = 0x0010;
+    // Every constant here is checked against the Windows SDK value by tests\Run-Tests.ps1 ("win32 constants").
+    const uint WM_HOTKEY = 0x0312, WM_TIMER = 0x0113, WM_QUERYENDSESSION = 0x0011, WM_ENDSESSION = 0x0016;
     const uint PM_REMOVE = 0x1;
     const uint MOD_ALT = 0x1, MOD_CONTROL = 0x2, MOD_SHIFT = 0x4, MOD_WIN = 0x8, MOD_NOREPEAT = 0x4000, VK_F12 = 0x7B, VK_F24 = 0x87;
     const int SW_SHOW = 5, SW_MINIMIZE = 6, SW_RESTORE = 9;
@@ -57,11 +64,10 @@ internal static class QuakeKey
     const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000, TOKEN_QUERY = 0x8;
     const int TokenElevation = 20, TokenUser = 1;
     const int DWMWA_CLOAKED = 14;
-    const uint SWP_ASYNCWINDOWPOS = 0x4000, SWP_NOACTIVATE = 0x0800, SWP_NOMOVE = 0x2, SWP_NOSIZE = 0x1;
     const uint WAIT_TIMEOUT = 0x102, STILL_ACTIVE = 259;
+    const int ERROR_HOTKEY_ALREADY_REGISTERED = 1409;
     const int HOTKEY_ID = 1, PROBE_ID = 2;
     const string QuakeClass = "CASCADIA_HOSTING_WINDOW_CLASS";
-    static readonly IntPtr HWND_MESSAGE = new IntPtr(-3);
 
     delegate IntPtr WndProcFn(IntPtr h, uint m, IntPtr w, IntPtr l);
     delegate bool EnumProc(IntPtr h, IntPtr l);
@@ -92,11 +98,9 @@ internal static class QuakeKey
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll", SetLastError = true)] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int hh, uint flags);
     [DllImport("user32.dll")] static extern void SwitchToThisWindow(IntPtr h, bool altTab);
     [DllImport("user32.dll")] static extern bool AllowSetForegroundWindow(uint pid);
     [DllImport("user32.dll")] static extern bool AttachThreadInput(uint attach, uint attachTo, bool on);
-    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
     [DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr h, int cmd);
     [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
@@ -118,33 +122,42 @@ internal static class QuakeKey
     [DllImport("kernel32.dll", SetLastError = true)] static extern uint WaitForSingleObject(IntPtr h, uint ms);
     [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr h, out uint code);
     [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool QueryFullProcessImageName(IntPtr process, int flags, StringBuilder name, ref int size);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool ProcessIdToSessionId(uint pid, out uint session);
     [DllImport("kernel32.dll")] static extern uint GetCurrentProcessId();
     [DllImport("advapi32.dll")] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
     [DllImport("advapi32.dll", SetLastError = true)] static extern bool GetTokenInformation(IntPtr token, int cls, IntPtr info, int len, out int retLen);
     [DllImport("advapi32.dll")] static extern bool EqualSid(IntPtr a, IntPtr b);
+    [DllImport("advapi32.dll")] static extern int GetLengthSid(IntPtr sid);
     [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int value, int size);
 
     // ---------------------------------------------------------------- state
-    // First: LogDir depends on it (static initializers run in textual order).
-    static readonly bool SelfElevated = IsElevated((uint)Process.GetCurrentProcess().Id);
+    // Static initializers run in textual order: LogDir needs SelfElevated and UserSid.
+    static readonly bool SelfElevated = IsElevated(GetCurrentProcessId());
+    static readonly string UserSid = WindowsIdentity.GetCurrent().User.Value;
 
-    // Release build, packaged, not elevated: "Windows Terminal <16 hex of the user SID hash>".
-    // The elevated instance is "Windows Terminal Admin <hash>" and is never targeted.
+    // Release build, packaged, not elevated: "Windows Terminal <16 hex of the user SID hash>" (WindowEmperor.cpp,
+    // HandleCommandlineArgs). Elevated ("... Admin ..."), Preview, Canary, Dev and unpackaged builds never match.
     static readonly Regex NormalEmperorClass = new Regex(@"^Windows Terminal [0-9a-f]{16}$");
     static readonly string WtPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Microsoft\WindowsApps\wt.exe");
+    static readonly string TerminalSettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        @"Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json");
 
-    // The elevated process logs to %ProgramData%\QuakeKey, a folder the installer creates admin-writable only, so a
-    // normal-privilege program cannot plant a link there and make an admin process write or delete files for it.
-    // Normal-privilege runs (the launcher, or a manual test run) log to %LOCALAPPDATA%\QuakeKey.
+    // The elevated process logs to %ProgramData%\QuakeKey\<user SID>, a folder the installer creates with an
+    // admin-only DACL (the user can read it), so a normal-privilege program cannot plant a link or a hard link there and
+    // make an admin process write or delete files for it. Normal-privilege runs log to %LOCALAPPDATA%\QuakeKey.
+    static readonly string LogRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "QuakeKey");
     static readonly string LogDir = SelfElevated
-        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "QuakeKey")
+        ? Path.Combine(LogRoot, UserSid)
         : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "QuakeKey");
     static string logName = "quakekey.log";
 
+    // The task folder install.ps1 registers for this user: Hotkey, StartShown, StartHidden.
+    static readonly string TaskFolder = @"\QuakeKey\" + UserSid + @"\";
+
     // Terminal's globalSummon _quake action is bound to this chord (install.ps1 sets it). Nobody presses it; it only
     // makes Terminal's binding hotkey index 0 and lets TerminalBindingPresent() see that the binding exists.
-    const string TerminalChord = "ctrl+alt+shift+F24";
+    internal const string TerminalChord = "ctrl+alt+shift+f24";
 
     struct HotKeySpec { public uint Mods, Vk; public string Text; }
     static HotKeySpec hotkey;
@@ -153,16 +166,15 @@ internal static class QuakeKey
     static IntPtr msgWindow;
     static bool hotkeyOn, hotkeyFailLogged, sessionEnding;
     static IntPtr quakeCache;
-    static DateTime nextLaunch = DateTime.MinValue;
-    static DateTime lastTerminalSeen = DateTime.MinValue;   // a Terminal that was alive recently: its exit is probably on purpose
-    static DateTime lastLaunchAt = DateTime.MinValue;       // a start is in flight: don't start a second one (audit #6)
-    static int launchesWithoutTerminal;
+    static DateTime lastLaunchAt = DateTime.MinValue;       // a start is in flight: don't start a second one
+    static readonly WatchdogPolicy watchdog = new WatchdogPolicy();
     static int ticks;
 
     // Usage:
-    //   QuakeKey.exe [--key <spec>]        own the hotkey (default F12); what the \QuakeKey\Hotkey task runs
-    //   QuakeKey.exe --start hidden|shown  start Terminal at normal privilege (the \QuakeKey\Start* tasks)
-    //   QuakeKey.exe --validate-key <spec> print "<normalized> vk=0x.. mods=0x.." and exit 0, or the reason and exit 2
+    //   QuakeKey.exe [--key <spec>]          own the hotkey (default F12); what the Hotkey task runs
+    //   QuakeKey.exe --start hidden|shown    start Terminal at normal privilege (the StartHidden / StartShown tasks)
+    //   QuakeKey.exe --validate-key <spec>   print "<normalized> vk=0x.. mods=0x.." and exit 0, or the reason and exit 2
+    //   QuakeKey.exe --check-settings <path> exit 0 if that settings.json binds the quake chord, 3 if not, 2 on errors
     // <spec>: modifiers ctrl, alt, shift, win joined with '+' to one key: F1-F24, A-Z, 0-9, numpad0-9, space, tab,
     // enter, esc, insert, delete, home, end, pageup, pagedown, up, down, left, right, pause, scrolllock, apps,
     // backtick, or vk:0xNN.
@@ -178,12 +190,20 @@ internal static class QuakeKey
             return 0;
         }
 
-        // Launcher mode, run at normal privilege by the \QuakeKey\StartShown|StartHidden tasks.
+        if (args.Length == 2 && args[0] == "--check-settings")
+        {
+            string message;
+            int code = Logic.CheckSettingsFile(args[1], TerminalChord, out message);
+            (code == 0 ? Console.Out : Console.Error).WriteLine(message);
+            return code;
+        }
+
+        // Launcher mode, run at normal privilege by the StartShown / StartHidden tasks.
         //  hidden: `wt -Embedding`, Terminal's windowless server mode (what Windows itself starts for default-terminal
-        //          hand-offs). No window, process stays up, global-summon table loaded: the first F12 creates the
+        //          hand-offs). No window, process stays up, global-summon table loaded: the first press creates the
         //          quake window inside the warm process. Terminal has no "start minimized" switch, and the show flag
-        //          of a CreateProcess is lost through the wt.exe alias (tested 2026-11-07), so this is the no-flash way.
-        //  shown:  `wt -w _quake`, used when F12 is pressed and no Terminal is running.
+        //          of a CreateProcess is lost through the wt.exe alias, so this is the no-flash way.
+        //  shown:  `wt -w _quake`, used when the key is pressed and no Terminal is running.
         if (args.Length == 2 && args[0] == "--start")
         {
             logName = "launcher.log";
@@ -200,22 +220,21 @@ internal static class QuakeKey
             return ok ? 0 : 1;
         }
 
-        // A profiler hook planted in the user environment would load a DLL into this process at startup; when we are
-        // elevated that DLL would run with admin rights, and by the time Main runs it is already too late to refuse
-        // loading it. So an elevated start refuses to run if one is set (the CLR honours COR_*/COMPlus_* variables).
+        // Tripwire, not a defense: .NET reads COR_* / COMPlus_* variables while it starts, so a profiler or another
+        // runtime knob planted in the user environment has already taken effect by the time Main runs. Refusing to
+        // carry on elevated at least stops QuakeKey from running that way unnoticed. See SECURITY.md.
         if (SelfElevated)
         {
-            var hooks = new[] { "COR_ENABLE_PROFILING", "COR_PROFILER", "COR_PROFILER_PATH", "COMPLUS_ENABLE_PROFILING" };
-            string planted = null;
-            foreach (var v in hooks) if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable(v))) planted = v;
+            string planted = Logic.RuntimeHookVariable(Environment.GetEnvironmentVariables());
             if (planted != null)
             {
-                Log("not starting elevated: the environment variable " + planted + " is set; QuakeKey refuses to run with a profiler hook. Delete it (HKCU\\Environment) and sign in again.");
+                Log("not starting elevated: the environment variable " + planted + " is set. .NET reads COR_* and COMPlus_* variables at startup,"
+                    + " so it may already have loaded code into this admin process. Delete it (HKCU\\Environment), sign out and in, and see SECURITY.md.");
                 return 0;
             }
         }
 
-        // Configuration errors exit 0: the task restarts us on failure, and a restart would not fix them.
+        // Configuration errors exit 0: running again would not fix them.
         string spec = "F12";
         if (args.Length == 2 && args[0] == "--key") spec = args[1];
         else if (args.Length != 0) { Log("unknown arguments: " + string.Join(" ", args) + " (not starting)"); return 0; }
@@ -223,10 +242,24 @@ internal static class QuakeKey
         if (!TryParseKey(spec, out hotkey, out error)) { Log("bad --key '" + spec + "': " + error + " (not starting)"); return 0; }
 
         // Two single-instance locks. A manual (non-elevated) start also checks for the elevated one and stands down,
-        // so double-clicking the exe cannot silently steal the key from the installed elevated copy.
+        // so double-clicking the exe cannot silently steal the key from the installed elevated copy. Any program in
+        // the session can create these names first; that case is detected and exits 1 (the Hotkey task's 5-minute
+        // repeat trigger tries again) instead of looking like a normal "already running".
         bool first;
-        using (var mine = new Mutex(true, SelfElevated ? @"Local\QuakeKey.elevated" : @"Local\QuakeKey.user", out first))
-        using (var elevatedRunning = new EventWaitHandle(false, EventResetMode.ManualReset, @"Local\QuakeKey.elevatedRunning"))
+        Mutex mine;
+        EventWaitHandle elevatedRunning;
+        try
+        {
+            mine = new Mutex(true, SelfElevated ? @"Local\QuakeKey.elevated" : @"Local\QuakeKey.user", out first);
+            elevatedRunning = new EventWaitHandle(false, EventResetMode.ManualReset, @"Local\QuakeKey.elevatedRunning");
+        }
+        catch (Exception ex)
+        {
+            Log("could not open QuakeKey's single-instance lock (" + ex.GetType().Name + ": " + ex.Message + "); another program may be holding its name. Exiting; Task Scheduler tries again within 5 minutes.");
+            return 1;
+        }
+        using (mine)
+        using (elevatedRunning)
         {
             if (SelfElevated) elevatedRunning.Set();
             else if (elevatedRunning.WaitOne(0))
@@ -236,11 +269,16 @@ internal static class QuakeKey
             }
             if (!first)
             {
+                if (SelfElevated && !OtherElevatedInstanceRunning())
+                {
+                    Log("the single-instance lock Local\\QuakeKey.elevated is held, but no other elevated QuakeKey is running: another program holds it. Exiting; Task Scheduler tries again within 5 minutes.");
+                    return 1;
+                }
                 Log("another QuakeKey with the same privileges is already running");
                 return 0;
             }
             try { Run(); return 0; }
-            catch (Exception ex) { Log("FATAL " + ex); return 1; }   // non-zero: the scheduled task restarts us
+            catch (Exception ex) { Log("FATAL " + ex); return 1; }   // the Hotkey task's 5-minute repeat trigger starts us again
         }
     }
 
@@ -255,7 +293,9 @@ internal static class QuakeKey
         msgWindow = CreateWindowEx(0, wc.lpszClassName, "QuakeKey", WS_OVERLAPPED, 0, 0, 0, 0, IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
         if (msgWindow == IntPtr.Zero) throw new Win32Exception();
 
-        Log("started, pid " + Process.GetCurrentProcess().Id + ", key " + K
+        int pid;
+        using (var self = Process.GetCurrentProcess()) pid = self.Id;
+        Log("started, pid " + pid + ", key " + K
             + (SelfElevated ? ", elevated" : ", NOT elevated: the key will not arrive while an admin window has focus"));
         TryRegisterHotkey();
         Watchdog();
@@ -275,17 +315,23 @@ internal static class QuakeKey
         {
             if (m == WM_HOTKEY && w.ToInt64() == HOTKEY_ID) { OnHotkey(); return IntPtr.Zero; }
             if (m == WM_TIMER) { OnTimer(); return IntPtr.Zero; }
-            if (m == WM_QUERYENDSESSION || m == WM_ENDSESSION)
+            if (m == WM_QUERYENDSESSION)
             {
-                sessionEnding = true;   // stops the watchdog; Terminal will come back at the next logon anyway
+                sessionEnding = true;   // pauses the watchdog; Terminal comes back at the next logon anyway
                 return new IntPtr(1);   // "go ahead"
+            }
+            if (m == WM_ENDSESSION)
+            {
+                // wParam FALSE: the shutdown or sign-out was cancelled (an app refused, or the user pressed Cancel).
+                sessionEnding = w != IntPtr.Zero;
+                return IntPtr.Zero;
             }
         }
         catch (Exception ex) { Log("ERROR " + ex); }
         return DefWindowProc(h, m, w, l);
     }
 
-    // ---------------------------------------------------------------- F12
+    // ---------------------------------------------------------------- the key
     static void OnHotkey()
     {
         var sw = Stopwatch.StartNew();
@@ -301,7 +347,7 @@ internal static class QuakeKey
                 AllowSetForegroundWindow(ASFW_ANY);
                 if (!StartQuake(false)) { DrainQueuedPresses(); return; }
                 lastLaunchAt = DateTime.Now;
-                nextLaunch = DateTime.Now.AddSeconds(15);
+                watchdog.Postpone(DateTime.Now.AddSeconds(15));
                 IntPtr started = WaitForShownQuake(0, 10000);
                 Log(K + " start: no Terminal was running; " + (started == IntPtr.Zero ? "quake window did not appear" : EnsureForeground(started))
                     + " [" + sw.ElapsedMilliseconds + " ms, focus was " + fgWas + "]");
@@ -319,7 +365,7 @@ internal static class QuakeKey
                 return;
             }
             // No quake-window wait here: a starting Terminal registers its global-summon hotkeys right after its
-            // message window exists, and the toggle below then creates the quake window itself.
+            // window exists, and the toggle below then creates the quake window itself.
         }
 
         // Focus may have moved during the waits above; decide "is the quake focused" from the current state.
@@ -332,7 +378,7 @@ internal static class QuakeKey
 
         if (!SafeToSendToggle())
         {
-            Log("WARNING: Terminal's ctrl+alt+shift+f24 binding is missing (settings.json changed or reset); toggling the window directly. Run the QuakeKey installer again to restore the binding.");
+            Log("WARNING: Terminal's settings do not bind " + TerminalChord + " to the quake window, or no Terminal holds that chord; toggling the window directly. Run install.ps1 again to restore the binding.");
             DirectToggle(quake, active, sw, fgWas);
             DrainQueuedPresses();
             return;
@@ -344,10 +390,11 @@ internal static class QuakeKey
 
         // Hotkey index 0 = Terminal's globalSummon _quake. Sent, not posted: SendMessageTimeout returns once Terminal
         // has run its toggle, so focus is forced only after that. Forcing it earlier would let Terminal see its window
-        // already focused and hide it again.
+        // already focused and hide it again. lParam is what Windows would send for the chord (Terminal ignores it).
         AllowSetForegroundWindow(pid);
         IntPtr ignored;
-        if (SendMessageTimeout(emperor, WM_HOTKEY, IntPtr.Zero, new IntPtr((int)VK_F12 << 16), SMTO_ABORTIFHUNG, 5000, out ignored) == IntPtr.Zero)
+        IntPtr chordLParam = new IntPtr((int)((VK_F24 << 16) | MOD_CONTROL | MOD_ALT | MOD_SHIFT));
+        if (SendMessageTimeout(emperor, WM_HOTKEY, IntPtr.Zero, chordLParam, SMTO_ABORTIFHUNG, 5000, out ignored) == IntPtr.Zero)
         {
             Log(K + ": Terminal did not finish the toggle within 5 s (busy or hung), error " + Marshal.GetLastWin32Error() + " [focus was " + fgWas + "]");
             DrainQueuedPresses();
@@ -356,7 +403,7 @@ internal static class QuakeKey
 
         if (active)
         {
-            // Terminal hides (minimize → hide) inside its handler, so the result is settled once the send returns.
+            // Terminal hides (minimize -> hide) inside its handler, so the result is settled once the send returns.
             bool stillUp = IsWindowVisible(quake) && !IsIconic(quake);
             Log(K + (!stillUp ? " hide [focus was the quake window]"
                 : mouseElsewhere ? ": Terminal moved the quake window to the mouse's monitor instead of hiding it (monitor: toMouse)"
@@ -393,12 +440,11 @@ internal static class QuakeKey
         while (PeekMessage(out m, msgWindow, WM_HOTKEY, WM_HOTKEY, PM_REMOVE)) { }
     }
 
-    // Sending hotkey index 0 is only safe while the target Terminal has a keyed globalSummon: WindowEmperor::
-    // _hotkeyPressed checks `index > size` rather than `>=`, so with no binding it reads past an empty vector and
-    // Terminal crashes, taking every tab with it. Two checks:
+    // Sending hotkey index 0 is only safe while the target Terminal has a global-summon binding:
+    // WindowEmperor::_hotkeyPressed checks `index > size` rather than `>=`, so with no binding it reads past an empty
+    // vector and Terminal crashes, taking every tab with it. Two checks:
     //  * a Terminal process holds the chord (it registers what its settings bind),
-    //  * the user's settings.json still mentions it (a third-party tool can hold an F24 chord too).
-    // settings.json may contain // comments; a simple outside-string strip is enough to search it for the chord.
+    //  * the user's settings.json binds the chord to the quake summon (a third-party tool can hold an F24 chord too).
     static bool TerminalBindingPresent()
     {
         if (!RegisterHotKey(msgWindow, PROBE_ID, MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F24)) return true;
@@ -408,37 +454,19 @@ internal static class QuakeKey
 
     static bool SafeToSendToggle()
     {
-        return TerminalBindingPresent() && SettingsMentionChord();
+        return TerminalBindingPresent() && SettingsBindChord();
     }
 
-    static bool SettingsMentionChord()
+    static bool SettingsBindChord()
     {
         try
         {
-            string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                @"Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json");
-            string text = File.ReadAllText(path);
-            string needle = "ctrl+alt+shift+f24";
-            int at = text.IndexOf(needle, StringComparison.OrdinalIgnoreCase);
-            return at >= 0 && !IsInsideComment(text, at);
+            var fi = new FileInfo(TerminalSettingsPath);
+            if (!fi.Exists || fi.Length > 8 * 1024 * 1024) return true;   // fall back to the hotkey probe alone
+            string why;
+            return Logic.SettingsBindChord(File.ReadAllText(fi.FullName), TerminalChord, out why);
         }
-        catch { return true; }   // unreadable file: fall back to the hotkey probe alone
-    }
-
-    static bool IsInsideComment(string text, int at)
-    {
-        bool inString = false, inLine = false, inBlock = false;
-        for (int i = 0; i < at; i++)
-        {
-            char c = text[i];
-            if (inLine) { if (c == '\n') inLine = false; continue; }
-            if (inBlock) { if (c == '*' && i + 1 < at && text[i + 1] == '/') { inBlock = false; i++; } continue; }
-            if (inString) { if (c == '\\') i++; else if (c == '"') inString = false; continue; }
-            if (c == '"') inString = true;
-            else if (c == '/' && i + 1 < at && text[i + 1] == '/') inLine = true;
-            else if (c == '/' && i + 1 < at && text[i + 1] == '*') { inBlock = true; i++; }
-        }
-        return inLine || inBlock;
+        catch { return true; }   // unreadable or not valid JSON (Terminal keeps its last good settings): probe alone
     }
 
     // Fallback without Terminal's toggle (no follow-the-mouse to another monitor). ShowWindowAsync everywhere:
@@ -463,9 +491,9 @@ internal static class QuakeKey
         Log(K + " direct show: " + EnsureForeground(quake) + " [" + sw.ElapsedMilliseconds + " ms, focus was " + fgWas + "]");
     }
 
-    // Attaching to the focused window's input queue is what works over admin windows (seen 2026-11-07: plain
-    // SetForegroundWindow failed there even from this elevated, hotkey-receiving process), so it goes first.
-    // Two rounds, in case another window grabs focus in the middle.
+    // Attaching to the focused window's input queue is what works over admin windows (plain SetForegroundWindow
+    // failed there even from this elevated, hotkey-receiving process), so it goes first. Two rounds, in case another
+    // window grabs focus in the middle. SetForegroundWindow also brings the window to the top of the z-order.
     static string EnsureForeground(IntPtr q)
     {
         if (IsIconic(q)) ShowWindowAsync(q, SW_RESTORE);
@@ -496,12 +524,7 @@ internal static class QuakeKey
         bool qResponsive = SendMessageTimeout(q, WM_NULL, IntPtr.Zero, IntPtr.Zero, SMTO_ABORTIFHUNG, 200, out qResult) != IntPtr.Zero;
         if (!qResponsive) return false;
         bool attached = responsive && fgThread != 0 && fgThread != me && AttachThreadInput(me, fgThread, true);
-        try
-        {
-            // SWP_ASYNCWINDOWPOS: the synchronous z-order change would wait for the target's thread.
-            SetWindowPos(q, new IntPtr(-1) /*HWND_TOP*/, 0, 0, 0, 0, SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
-            SetForegroundWindow(q);
-        }
+        try { SetForegroundWindow(q); }
         finally { if (attached) AttachThreadInput(me, fgThread, false); }
         return attached;
     }
@@ -540,10 +563,10 @@ internal static class QuakeKey
     // why a plain F12 hotkey fails with 1409 on a default system. install.ps1 moves it to Scroll Lock (needs a reboot).
     static string HotkeyBusyReason(int err)
     {
-        if (err == 1409 && (hotkey.Mods == 0 || hotkey.Mods == MOD_SHIFT) && hotkey.Vk == DebuggerBreakVk())
+        if (err == ERROR_HOTKEY_ALREADY_REGISTERED && (hotkey.Mods == 0 || hotkey.Mods == MOD_SHIFT) && hotkey.Vk == DebuggerBreakVk())
             return "Windows reserves it for the debugger break key (HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug"
                  + " UserDebuggerHotKey); install.ps1 moves that to Scroll Lock, then reboot";
-        if (err == 1409) return "another program holds it (is Terminal itself still bound to it in settings.json?)";
+        if (err == ERROR_HOTKEY_ALREADY_REGISTERED) return "another program holds it (is Terminal itself still bound to it in settings.json?)";
         return "Windows refused it";
     }
 
@@ -598,17 +621,17 @@ internal static class QuakeKey
         vk = 0;
         name = t;
         int n;
-        if (t.Length >= 2 && t[0] == 'f' && int.TryParse(t.Substring(1), out n) && n >= 1 && n <= 24) { vk = (uint)(0x70 + n - 1); name = "F" + n; return true; }
+        if (t.Length >= 2 && t[0] == 'f' && int.TryParse(t.Substring(1), NumberStyles.None, CultureInfo.InvariantCulture, out n) && n >= 1 && n <= 24) { vk = (uint)(0x70 + n - 1); name = "F" + n; return true; }
         if (t.Length == 1 && t[0] >= 'a' && t[0] <= 'z') { vk = (uint)char.ToUpperInvariant(t[0]); name = t.ToUpperInvariant(); return true; }
         if (t.Length == 1 && t[0] >= '0' && t[0] <= '9') { vk = t[0]; return true; }
-        if (t.Length == 7 && t.StartsWith("numpad") && t[6] >= '0' && t[6] <= '9') { vk = (uint)(0x60 + t[6] - '0'); return true; }
-        if (t.StartsWith("vk:"))
+        if (t.Length == 7 && t.StartsWith("numpad", StringComparison.Ordinal) && t[6] >= '0' && t[6] <= '9') { vk = (uint)(0x60 + t[6] - '0'); return true; }
+        if (t.StartsWith("vk:", StringComparison.Ordinal))
         {
             string v = t.Substring(3);
             uint parsed;
-            bool ok = v.StartsWith("0x")
-                ? uint.TryParse(v.Substring(2), System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out parsed)
-                : uint.TryParse(v, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out parsed);
+            bool ok = v.StartsWith("0x", StringComparison.Ordinal)
+                ? uint.TryParse(v.Substring(2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out parsed)
+                : uint.TryParse(v, NumberStyles.None, CultureInfo.InvariantCulture, out parsed);
             if (!ok || parsed == 0 || parsed > 0xFE) return false;
             vk = parsed;
             name = "vk:0x" + parsed.ToString("X2");
@@ -648,42 +671,52 @@ internal static class QuakeKey
     {
         if (sessionEnding) return;
         IntPtr emperor; uint pid;
-        if (FindNormalTerminal(out emperor, out pid) || NormalTerminalProcessRunning())
+        bool running = FindNormalTerminal(out emperor, out pid) || NormalTerminalProcessRunning();
+        switch (watchdog.Decide(DateTime.Now, running))
         {
-            lastTerminalSeen = DateTime.Now;
-            launchesWithoutTerminal = 0;
-            return;
+            case WatchdogStep.Grace:
+                Log("Terminal exited; waiting " + (int)WatchdogPolicy.ExitGrace.TotalMinutes + " minutes before starting a background one (press the key to start it now)");
+                break;
+            case WatchdogStep.Start:
+                Log("no non-elevated Terminal running, starting one in the background");
+                if (StartQuake(true)) lastLaunchAt = DateTime.Now;
+                break;
         }
-        if (DateTime.Now < nextLaunch) return;
-
-        // A Terminal that was alive in the last 10 minutes probably exited on purpose (user typed exit / closed it).
-        // Restarting it immediately would fight the user, so wait longer the first time.
-        if (lastTerminalSeen != DateTime.MinValue && DateTime.Now - lastTerminalSeen < TimeSpan.FromMinutes(10) && launchesWithoutTerminal == 0)
-        {
-            Log("Terminal exited on its own; waiting 2 minutes before starting a background one (press the key to start it now)");
-            nextLaunch = DateTime.Now.AddMinutes(2);
-            return;
-        }
-
-        Log("no non-elevated Terminal running, starting one in the background");
-        if (StartQuake(true)) lastLaunchAt = DateTime.Now;
-        launchesWithoutTerminal++;
-        // 15 s, 30 s, 60 s ... 5 min between attempts while Terminal will not come up.
-        nextLaunch = DateTime.Now.AddSeconds(Math.Min(300, 15 * Math.Pow(2, launchesWithoutTerminal - 1)));
     }
 
-    // A Terminal of this user, in this session, not elevated — including one still starting up (no message window yet).
-    // Preview, Canary, unpackaged and other users' builds also run as WindowsTerminal.exe but can never be driven
-    // through the message window, so they do not count.
+    // A Terminal of this user, in this session, not elevated, the release package - including one still starting up
+    // (no window yet). Preview, Canary, unpackaged and other users' Terminals also run as WindowsTerminal.exe but can
+    // never be driven through the window QuakeKey looks for, so they do not count.
     static bool NormalTerminalProcessRunning()
     {
         foreach (var p in Process.GetProcessesByName("WindowsTerminal"))
         {
             try
             {
-                if (p.SessionId == Process.GetCurrentProcess().SessionId && !IsElevated((uint)p.Id)) return true;
+                if (IsDrivableTerminal((uint)p.Id)) return true;
             }
             catch { }   // process exited between enumeration and query
+            finally { p.Dispose(); }
+        }
+        return false;
+    }
+
+    static bool IsDrivableTerminal(uint pid)
+    {
+        return SameSession(pid) && SameUser(pid) && !IsElevated(pid) && Logic.IsReleaseTerminalImage(ProcessImagePath(pid));
+    }
+
+    static bool OtherElevatedInstanceRunning()
+    {
+        uint me = GetCurrentProcessId();
+        foreach (var p in Process.GetProcessesByName("QuakeKey"))
+        {
+            try
+            {
+                uint id = (uint)p.Id;
+                if (id != me && SameSession(id) && SameUser(id) && IsElevated(id)) return true;
+            }
+            catch { }
             finally { p.Dispose(); }
         }
         return false;
@@ -693,7 +726,7 @@ internal static class QuakeKey
     static bool StartQuake(bool background)
     {
         if (!SelfElevated) return StartDirect(background ? "-Embedding" : "-w _quake");
-        string task = background ? @"\QuakeKey\StartHidden" : @"\QuakeKey\StartShown";
+        string task = TaskFolder + (background ? "StartHidden" : "StartShown");
         var si = new STARTUPINFO();
         si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
         var cmd = new StringBuilder("\"" + Path.Combine(Environment.SystemDirectory, "schtasks.exe") + "\" /run /tn \"" + task + "\"");
@@ -704,17 +737,18 @@ internal static class QuakeKey
             return false;
         }
         CloseHandle(pi.hThread);
-        // schtasks returns 0 when the task actually ran, not when it merely started: wait for that.
+        // schtasks exits 0 once Task Scheduler has accepted the run request: wait for that (briefly, this blocks the
+        // thread that answers the key).
         uint exit = STILL_ACTIVE;
         bool timedOut = false;
         try
         {
-            uint wait = WaitForSingleObject(pi.hProcess, 30000);
+            uint wait = WaitForSingleObject(pi.hProcess, 10000);
             timedOut = wait == WAIT_TIMEOUT;
             if (!timedOut) GetExitCodeProcess(pi.hProcess, out exit);
         }
         finally { CloseHandle(pi.hProcess); }
-        if (timedOut) { Log("task " + task + " did not report within 30 s"); return true; }   // the task may still run
+        if (timedOut) { Log("task " + task + " did not report within 10 s"); return true; }   // the task may still run
         if (exit != 0) { Log("task " + task + " failed (exit code " + exit + "); is it registered? run install.ps1"); return false; }
         return true;
     }
@@ -728,7 +762,8 @@ internal static class QuakeKey
         string cwd = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         if (!CreateProcess(null, cmd, IntPtr.Zero, IntPtr.Zero, false, NORMAL_PRIORITY_CLASS, IntPtr.Zero, cwd, ref si, out pi))
         {
-            Log("could not start Terminal (" + WtPath + "): error " + Marshal.GetLastWin32Error());
+            Log("could not start Terminal (" + WtPath + "): error " + Marshal.GetLastWin32Error()
+                + (File.Exists(WtPath) ? "" : "; the wt.exe app execution alias is off (Settings > Apps > Advanced app settings > App execution aliases)"));
             return false;
         }
         CloseHandle(pi.hThread);
@@ -747,8 +782,8 @@ internal static class QuakeKey
             uint owner;
             GetWindowThreadProcessId(h, out owner);
             // This user's session only: another account's Terminal produces the same class pattern (its SID hash
-            // differs) and must never be driven. The elevated instance's class contains " Admin " and never matches.
-            if (!SameSession(owner) || !SameUser(owner)) return true;
+            // differs) and must never be driven.
+            if (!IsDrivableTerminal(owner)) return true;
             found = h;
             foundPid = owner;
             return false;
@@ -866,6 +901,19 @@ internal static class QuakeKey
         return name + "#" + pid + (IsElevated(pid) ? " (elevated)" : "");
     }
 
+    static string ProcessImagePath(uint pid)
+    {
+        IntPtr proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        if (proc == IntPtr.Zero) return null;
+        try
+        {
+            var sb = new StringBuilder(1024);
+            int size = sb.Capacity;
+            return QueryFullProcessImageName(proc, 0, sb, ref size) ? sb.ToString(0, size) : null;
+        }
+        finally { CloseHandle(proc); }
+    }
+
     // A token this process cannot read belongs to a higher-integrity (elevated) process.
     static bool IsElevated(uint pid)
     {
@@ -891,16 +939,14 @@ internal static class QuakeKey
         finally { CloseHandle(proc); }
     }
 
-    [DllImport("advapi32.dll")] static extern int GetLengthSid(IntPtr sid);
-
     static bool SameSession(uint pid)
     {
         uint mine, theirs;
         return ProcessIdToSessionId(GetCurrentProcessId(), out mine) && ProcessIdToSessionId(pid, out theirs) && mine == theirs;
     }
 
-    // The interactive user's Terminal, not one started under another account (its message window class matches the
-    // same pattern; driving someone else's Terminal would toggle their windows and could crash it, see SafeToSendToggle).
+    // The interactive user's process, not one started under another account (a Terminal's window class matches the
+    // same pattern; driving someone else's Terminal would toggle their windows and could crash it).
     static bool SameUser(uint pid)
     {
         IntPtr sid = ProcessSid(pid), mySid = ProcessSid(GetCurrentProcessId());
@@ -946,18 +992,22 @@ internal static class QuakeKey
         finally { CloseHandle(proc); }
     }
 
+    static bool IsLink(string path)
+    {
+        return (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0;
+    }
+
     static void Log(string line)
     {
         try
         {
-            var dir = new DirectoryInfo(LogDir);
             if (SelfElevated)
             {
-                // Only the installer creates this folder (admin-only ACL). Never create it here, and never write
+                // Only the installer creates these folders (admin-only DACL). Never create them here, and never write
                 // through a junction or symlink, which is how a planted link would redirect an admin write.
-                if (!dir.Exists || (dir.Attributes & FileAttributes.ReparsePoint) != 0) return;
+                if (!Directory.Exists(LogRoot) || IsLink(LogRoot) || !Directory.Exists(LogDir) || IsLink(LogDir)) return;
             }
-            else dir.Create();
+            else Directory.CreateDirectory(LogDir);
             string path = Path.Combine(LogDir, logName);
             var fi = new FileInfo(path);
             if (fi.Exists && (fi.Attributes & FileAttributes.ReparsePoint) != 0) return;
@@ -967,8 +1017,343 @@ internal static class QuakeKey
                 try { File.Delete(path + ".old"); } catch { }
                 try { File.Move(path, path + ".old"); } catch { }
             }
-            File.AppendAllText(path, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + line + Environment.NewLine);
+            File.AppendAllText(path, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture) + "  " + line + Environment.NewLine);
         }
         catch { }
+    }
+}
+
+// ---------------------------------------------------------------- watchdog policy
+internal enum WatchdogStep { Wait, Grace, Start }
+
+// When to start a background Terminal. Pure (the caller passes the time), so the tests drive it with a fake clock.
+internal sealed class WatchdogPolicy
+{
+    // A Terminal seen within RecentlySeen that is now gone probably exited on purpose (the user closed it or typed
+    // exit): wait ExitGrace once before starting a background one, instead of fighting the user.
+    internal static readonly TimeSpan RecentlySeen = TimeSpan.FromMinutes(10);
+    internal static readonly TimeSpan ExitGrace = TimeSpan.FromMinutes(2);
+
+    DateTime nextLaunch = DateTime.MinValue;
+    DateTime lastTerminalSeen = DateTime.MinValue;
+    bool graceGiven;
+    int launchesWithoutTerminal;
+
+    internal WatchdogStep Decide(DateTime now, bool terminalRunning)
+    {
+        if (terminalRunning)
+        {
+            lastTerminalSeen = now;
+            launchesWithoutTerminal = 0;
+            graceGiven = false;
+            return WatchdogStep.Wait;
+        }
+        if (now < nextLaunch) return WatchdogStep.Wait;
+        if (!graceGiven && lastTerminalSeen != DateTime.MinValue && now - lastTerminalSeen < RecentlySeen)
+        {
+            graceGiven = true;
+            nextLaunch = now + ExitGrace;
+            return WatchdogStep.Grace;
+        }
+        launchesWithoutTerminal++;
+        // 15 s, 30 s, 60 s ... 5 min between attempts while Terminal will not come up.
+        nextLaunch = now.AddSeconds(Math.Min(300, 15 * Math.Pow(2, launchesWithoutTerminal - 1)));
+        return WatchdogStep.Start;
+    }
+
+    // A start made outside the watchdog (the key was pressed with no Terminal running).
+    internal void Postpone(DateTime until)
+    {
+        if (until > nextLaunch) nextLaunch = until;
+    }
+}
+
+// ---------------------------------------------------------------- pure helpers
+internal static class Logic
+{
+    // The release package's Terminal: ...\WindowsApps\Microsoft.WindowsTerminal_<version>_<arch>__8wekyb3d8bbwe\WindowsTerminal.exe.
+    // Preview (Microsoft.WindowsTerminalPreview_...), Canary and unpackaged copies do not match.
+    static readonly Regex ReleaseTerminalImage = new Regex(
+        @"\\WindowsApps\\Microsoft\.WindowsTerminal_[^\\]+__8wekyb3d8bbwe\\WindowsTerminal\.exe$", RegexOptions.IgnoreCase);
+
+    internal static bool IsReleaseTerminalImage(string path)
+    {
+        return !string.IsNullOrEmpty(path) && ReleaseTerminalImage.IsMatch(path);
+    }
+
+    // The first COR_* or COMPlus_* environment variable with a value (sorted by name), or null.
+    internal static string RuntimeHookVariable(IDictionary environment)
+    {
+        var names = new List<string>();
+        foreach (DictionaryEntry e in environment)
+        {
+            string name = e.Key as string;
+            string value = e.Value as string;
+            if (name == null || string.IsNullOrEmpty(value)) continue;
+            if (name.StartsWith("COR_", StringComparison.OrdinalIgnoreCase) || name.StartsWith("COMPLUS_", StringComparison.OrdinalIgnoreCase))
+                names.Add(name);
+        }
+        if (names.Count == 0) return null;
+        names.Sort(StringComparer.OrdinalIgnoreCase);
+        return names[0];
+    }
+
+    // Terminal key chord text, normalized the way scripts\QuakeKey.Common.ps1 (ConvertTo-QkChord) does it.
+    internal static string NormalizeChord(string keys)
+    {
+        if (keys == null) return null;
+        bool ctrl = false, alt = false, shift = false, win = false;
+        string key = "";
+        foreach (string raw in keys.ToLowerInvariant().Split('+'))
+        {
+            string p = raw.Trim();
+            if (p == "ctrl") ctrl = true;
+            else if (p == "alt") alt = true;
+            else if (p == "shift") shift = true;
+            else if (p == "win") win = true;
+            else key = p == "`" ? "sc(41)" : p;
+        }
+        return (ctrl ? "ctrl+" : "") + (alt ? "alt+" : "") + (shift ? "shift+" : "") + (win ? "win+" : "") + key;
+    }
+
+    // True when settings.json binds `chord` to a summon of the quake window: the binding that keeps Terminal's global
+    // hotkey table from being empty. Terminal applies inline "keys" on actions first, then "keybindings"; for one
+    // chord the last binding wins, and "id": null unbinds it.
+    internal static bool SettingsBindChord(string json, string chord, out string why)
+    {
+        var root = JsonC.Parse(json) as Dictionary<string, object>;
+        if (root == null) { why = "settings.json is not a JSON object"; return false; }
+        string want = NormalizeChord(chord);
+        var byId = new Dictionary<string, Dictionary<string, object>>(StringComparer.Ordinal);
+        bool bound = false;
+        string boundTo = null;
+        object command = null;
+        foreach (object a in AsList(Get(root, "actions")))
+        {
+            var action = a as Dictionary<string, object>;
+            if (action == null) continue;
+            string id = Get(action, "id") as string;
+            if (id != null) byId[id] = action;
+            if (!KeysMatch(Get(action, "keys"), want)) continue;
+            bound = true;
+            boundTo = id ?? "an action without an id";
+            command = Get(action, "command");
+        }
+        foreach (object b in AsList(Get(root, "keybindings")))
+        {
+            var binding = b as Dictionary<string, object>;
+            if (binding == null || !KeysMatch(Get(binding, "keys"), want)) continue;
+            bound = true;
+            boundTo = Get(binding, "id") as string;
+            Dictionary<string, object> action;
+            command = boundTo != null && byId.TryGetValue(boundTo, out action) ? Get(action, "command") : null;
+            if (boundTo == "Terminal.QuakeMode") command = "quakeMode";
+        }
+        if (!bound) { why = want + " is not bound"; return false; }
+        if (boundTo == null) { why = want + " is unbound (\"id\": null)"; return false; }
+        if (!IsQuakeSummon(command)) { why = want + " is bound to " + boundTo + ", which does not summon the _quake window"; return false; }
+        why = want + " -> " + boundTo;
+        return true;
+    }
+
+    // --check-settings: 0 = bound, 3 = not bound, 2 = the file could not be read or parsed.
+    internal static int CheckSettingsFile(string path, string chord, out string message)
+    {
+        string text;
+        try { text = File.ReadAllText(path); }
+        catch (Exception ex) { message = "error: " + ex.Message; return 2; }
+        try
+        {
+            string why;
+            bool ok = SettingsBindChord(text, chord, out why);
+            message = (ok ? "ok: " : "missing: ") + why;
+            return ok ? 0 : 3;
+        }
+        catch (FormatException ex) { message = "error: settings.json is not valid JSON: " + ex.Message; return 2; }
+    }
+
+    static bool IsQuakeSummon(object command)
+    {
+        var text = command as string;
+        if (text != null) return text == "quakeMode";
+        var args = command as Dictionary<string, object>;
+        if (args == null) return false;
+        var action = Get(args, "action") as string;
+        if (action == "quakeMode") return true;
+        return action == "globalSummon" && (Get(args, "name") as string) == "_quake";
+    }
+
+    static bool KeysMatch(object keys, string want)
+    {
+        var text = keys as string;
+        if (text != null) return NormalizeChord(text) == want;
+        foreach (object k in AsList(keys))
+        {
+            var s = k as string;
+            if (s != null && NormalizeChord(s) == want) return true;
+        }
+        return false;
+    }
+
+    static object Get(Dictionary<string, object> o, string name)
+    {
+        object v;
+        return o.TryGetValue(name, out v) ? v : null;
+    }
+
+    static List<object> AsList(object v)
+    {
+        var list = v as List<object>;
+        if (list != null) return list;
+        var one = new List<object>();
+        if (v != null) one.Add(v);
+        return one;
+    }
+}
+
+// JSON with // and /* */ comments and trailing commas, as Windows Terminal accepts it. Objects become
+// Dictionary<string, object>, arrays List<object>, numbers double. Throws FormatException on bad input.
+internal sealed class JsonC
+{
+    readonly string s;
+    int i;
+
+    JsonC(string text) { s = text; }
+
+    internal static object Parse(string text)
+    {
+        if (text == null) throw new ArgumentNullException("text");
+        var p = new JsonC(text);
+        p.Skip();
+        object v = p.Value(0);
+        p.Skip();
+        if (p.i != p.s.Length) throw p.Error("unexpected text after the end");
+        return v;
+    }
+
+    FormatException Error(string what) { return new FormatException(what + " at offset " + i); }
+
+    void Skip()
+    {
+        while (i < s.Length)
+        {
+            char c = s[i];
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == (char)0xFEFF) { i++; continue; }
+            if (c == '/' && i + 1 < s.Length && s[i + 1] == '/') { while (i < s.Length && s[i] != '\n') i++; continue; }
+            if (c == '/' && i + 1 < s.Length && s[i + 1] == '*')
+            {
+                int end = s.IndexOf("*/", i + 2, StringComparison.Ordinal);
+                if (end < 0) throw Error("unterminated /* comment");
+                i = end + 2;
+                continue;
+            }
+            return;
+        }
+    }
+
+    object Value(int depth)
+    {
+        if (depth > 256) throw Error("nested too deeply");
+        if (i >= s.Length) throw Error("unexpected end");
+        char c = s[i];
+        if (c == '{') return ObjectValue(depth);
+        if (c == '[') return ArrayValue(depth);
+        if (c == '"') return StringValue();
+        if (Word("true")) return true;
+        if (Word("false")) return false;
+        if (Word("null")) return null;
+        return NumberValue();
+    }
+
+    bool Word(string w)
+    {
+        if (i + w.Length > s.Length || string.CompareOrdinal(s, i, w, 0, w.Length) != 0) return false;
+        i += w.Length;
+        return true;
+    }
+
+    Dictionary<string, object> ObjectValue(int depth)
+    {
+        var o = new Dictionary<string, object>(StringComparer.Ordinal);
+        i++;
+        while (true)
+        {
+            Skip();
+            if (i < s.Length && s[i] == '}') { i++; return o; }
+            if (i >= s.Length || s[i] != '"') throw Error("expected a property name");
+            string key = StringValue();
+            Skip();
+            if (i >= s.Length || s[i] != ':') throw Error("expected ':'");
+            i++;
+            Skip();
+            o[key] = Value(depth + 1);
+            Skip();
+            if (i < s.Length && s[i] == ',') { i++; continue; }
+            if (i < s.Length && s[i] == '}') { i++; return o; }
+            throw Error("expected ',' or '}'");
+        }
+    }
+
+    List<object> ArrayValue(int depth)
+    {
+        var a = new List<object>();
+        i++;
+        while (true)
+        {
+            Skip();
+            if (i < s.Length && s[i] == ']') { i++; return a; }
+            a.Add(Value(depth + 1));
+            Skip();
+            if (i < s.Length && s[i] == ',') { i++; continue; }
+            if (i < s.Length && s[i] == ']') { i++; return a; }
+            throw Error("expected ',' or ']'");
+        }
+    }
+
+    string StringValue()
+    {
+        i++;
+        var sb = new StringBuilder();
+        while (true)
+        {
+            if (i >= s.Length) throw Error("unterminated string");
+            char c = s[i++];
+            if (c == '"') return sb.ToString();
+            if (c != '\\') { sb.Append(c); continue; }
+            if (i >= s.Length) throw Error("unterminated string");
+            char e = s[i++];
+            switch (e)
+            {
+                case '"': sb.Append('"'); break;
+                case '\\': sb.Append('\\'); break;
+                case '/': sb.Append('/'); break;
+                case 'b': sb.Append('\b'); break;
+                case 'f': sb.Append('\f'); break;
+                case 'n': sb.Append('\n'); break;
+                case 'r': sb.Append('\r'); break;
+                case 't': sb.Append('\t'); break;
+                case 'u':
+                    int code;
+                    if (i + 4 > s.Length || !int.TryParse(s.Substring(i, 4), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out code))
+                        throw Error("bad \\u escape");
+                    sb.Append((char)code);
+                    i += 4;
+                    break;
+                default: throw Error("bad escape \\" + e);
+            }
+        }
+    }
+
+    object NumberValue()
+    {
+        int start = i;
+        while (i < s.Length && "+-0123456789.eE".IndexOf(s[i]) >= 0) i++;
+        double d;
+        if (i == start || !double.TryParse(s.Substring(start, i - start), NumberStyles.Float, CultureInfo.InvariantCulture, out d))
+        {
+            i = start;
+            throw Error("unexpected character '" + s[start] + "'");
+        }
+        return d;
     }
 }

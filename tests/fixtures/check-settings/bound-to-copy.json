@@ -1,0 +1,4 @@
+{
+    "actions": [ { "command": "copy", "id": "User.copy" } ],
+    "keybindings": [ { "id": "User.copy", "keys": "ctrl+alt+shift+f24" } ]
+}

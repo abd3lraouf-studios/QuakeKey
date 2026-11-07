@@ -1,24 +1,30 @@
 <#
 .SYNOPSIS
-    Removes QuakeKey and restores the Windows Terminal key bindings it changed.
+    Removes QuakeKey for your account and restores the Windows Terminal key bindings it changed.
 
 .DESCRIPTION
-    1. After one UAC prompt: stops QuakeKey, removes its scheduled tasks, C:\Program Files\QuakeKey and (unless
-       -KeepLogs) C:\ProgramData\QuakeKey.
+    1. After one UAC prompt: stops your QuakeKey, removes your scheduled tasks (\QuakeKey\<your SID>\) and, unless
+       -KeepLogs, your log folder C:\ProgramData\QuakeKey\<your SID>. When no other account on this PC still uses
+       QuakeKey, it also removes C:\Program Files\QuakeKey and C:\ProgramData\QuakeKey and puts the debugger break
+       key (HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AeDebug UserDebuggerHotKey) back to the value it had
+       before the install, if the installer moved it.
     2. Undoes the installer's changes to Windows Terminal's settings.json (backup first), using the record the
        installer saved in %LOCALAPPDATA%\QuakeKey\terminal-state.json: Terminal gets its previous quake key back.
-
-    The debugger break key (HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AeDebug UserDebuggerHotKey), if the
-    installer moved it to free F12, is left where it is.
+    3. Removes %LOCALAPPDATA%\QuakeKey except its backups folder.
 
 .PARAMETER KeepTerminalSettings
-    Leave Windows Terminal's settings.json as it is.
+    Leave Windows Terminal's settings.json as it is. Terminal then has no working quake key (its quake action stays
+    bound only to ctrl+alt+shift+f24) until you bind one yourself.
 
 .PARAMETER KeepLogs
-    Keep C:\ProgramData\QuakeKey.
+    Keep the log folder(s) under C:\ProgramData\QuakeKey.
+
+.PARAMETER KeepDebuggerKey
+    Leave the debugger break key where the installer moved it (so F12 stays free for other programs).
 #>
 [CmdletBinding()]
-param([switch]$KeepTerminalSettings, [switch]$KeepLogs)
+param([switch]$KeepTerminalSettings, [switch]$KeepLogs, [switch]$KeepDebuggerKey)
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'scripts\QuakeKey.Common.ps1')
 Reset-QkModulePathFor51
@@ -27,11 +33,18 @@ $paths = Get-QkPaths
 try {
     # QuakeKey goes first: while it runs it holds the hotkey, and Terminal could not take its key back.
     Write-QkStep 'Removing QuakeKey (Windows asks for administrator permission once)'
-    $result = Invoke-QkElevated -Mode Uninstall -Parameters @{ KeepLogs = [bool]$KeepLogs }
+    $result = Invoke-QkElevated -Mode Uninstall -Parameters @{
+        User            = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        KeepLogs        = [bool]$KeepLogs
+        KeepDebuggerKey = [bool]$KeepDebuggerKey
+    }
     $result.messages | ForEach-Object { Write-QkNote $_ }
     if (-not $result.ok) { throw 'The elevated uninstall step failed (see above). Windows Terminal settings were not changed.' }
 
-    if (-not $KeepTerminalSettings -and (Test-Path -LiteralPath $paths.TerminalSettings)) {
+    if ($KeepTerminalSettings) {
+        Write-QkWarn "settings.json was left as it is (-KeepTerminalSettings): Terminal's quake action is bound only to $QkTerminalChord, so there is no quake key until you bind one (or run uninstall.ps1 again without -KeepTerminalSettings)."
+    }
+    elseif (Test-Path -LiteralPath $paths.TerminalSettings) {
         Write-QkStep 'Restoring Windows Terminal key bindings'
         $state = $null
         if (Test-Path -LiteralPath $paths.StateFile) { $state = Get-Content -LiteralPath $paths.StateFile -Raw | ConvertFrom-Json }
@@ -41,24 +54,23 @@ try {
         $shapeBefore = Get-QkSettingsShape $settings
         $undo = Undo-QkTerminalBinding -Settings $settings -State $state
         if ($undo.Changes.Count) {
-            New-Item -ItemType Directory -Force $paths.BackupDir | Out-Null
-            $backup = Join-Path $paths.BackupDir ('settings-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-before-uninstall.json')
-            Copy-Item -LiteralPath $paths.TerminalSettings -Destination $backup
-            Write-QkJsonFile $paths.TerminalSettings $undo.Settings
-            $shapeAfter = Get-QkSettingsShape (Read-QkJsonFile $paths.TerminalSettings)
-            if ($shapeAfter -ne $shapeBefore) {
-                Copy-Item -LiteralPath $backup -Destination $paths.TerminalSettings -Force
-                throw "Rewriting settings.json would have changed more than its key bindings ($shapeBefore -> $shapeAfter). The original was put back."
-            }
+            $saved = Save-QkTerminalSettings -Path $paths.TerminalSettings -Settings $undo.Settings -BackupDir $paths.BackupDir -ShapeBefore $shapeBefore -Suffix '-before-uninstall'
             $undo.Changes | ForEach-Object { Write-QkNote $_ }
-            Write-QkNote "backup of the previous file: $backup"
+            Write-QkNote "backup of the previous file: $($saved.Backup)"
         }
         else { Write-QkNote 'nothing to restore' }
-        if ($state) { Remove-Item -LiteralPath $paths.StateFile -Force }
     }
 
-    if ((Get-QkDebuggerBreakVk) -ne 0x7B) {
-        Write-QkNote 'The debugger break key stays moved (UserDebuggerHotKey). Set it back to 0 if you want F12 for debuggers again.'
+    # Local leftovers: the install record, the launcher's log, results of interrupted runs. Backups stay.
+    if (Test-Path -LiteralPath $paths.UserDir) {
+        Get-ChildItem -LiteralPath $paths.UserDir -Force | Where-Object { $_.Name -ne 'backups' } | ForEach-Object { Remove-QkTreeSafely $_.FullName }
+        if (Test-Path -LiteralPath $paths.BackupDir) { Write-QkNote "settings.json backups are kept in $($paths.BackupDir)" }
+        else { Remove-QkTreeSafely $paths.UserDir }
+    }
+
+    if ($result.rebootNeeded) { Write-QkNote 'Reboot to give the debugger break key back to F12.' }
+    elseif ((Get-QkDebuggerBreakVk) -ne 0x7B) {
+        Write-QkNote 'The debugger break key (UserDebuggerHotKey) is not on F12; F12 stays free for other programs.'
     }
     Write-Host ''
     Write-Host 'QuakeKey is removed.' -ForegroundColor Green

@@ -1,18 +1,23 @@
 # Elevated half of install.ps1 and uninstall.ps1. They start it with a single UAC prompt; do not run it directly.
-#  Install:   copies QuakeKey.exe to Program Files, creates the admin-only log folder, optionally moves the debugger
-#             break key off the chosen hotkey, registers the scheduled tasks and starts QuakeKey.
-#  Uninstall: stops QuakeKey and removes its tasks, Program Files folder and (unless -KeepLogs) its logs.
-# Writes a JSON result to -ResultFile (created new; never overwrites an existing file).
+#  Install:   copies the built QuakeKey.exe to Program Files after checking its SHA-256, creates the admin-only log
+#             folders, optionally moves the debugger break key off the chosen hotkey (recording the old value),
+#             registers this user's scheduled tasks under \QuakeKey\<SID>\ and starts QuakeKey.
+#  Uninstall: stops this user's QuakeKey and removes their tasks and log folder. The last user to uninstall also
+#             removes Program Files\QuakeKey and the log root, and puts the debugger break key back.
+# Writes a JSON result to -ResultFile (created new; never overwrites an existing file or writes through a link).
 param(
     [Parameter(Mandatory)][ValidateSet('Install', 'Uninstall')][string]$Mode,
     [Parameter(Mandatory)][string]$ResultFile,
-    [string]$Source,
-    [string]$Key = 'F12',
     [string]$User,
+    [string]$Source,
+    [string]$SourceSha256,
+    [string]$Key = 'F12',
     [switch]$MoveDebuggerKey,
     [int]$DebuggerBreakVk = 0x91,
-    [switch]$KeepLogs
+    [switch]$KeepLogs,
+    [switch]$KeepDebuggerKey
 )
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'QuakeKey.Common.ps1')
 Reset-QkModulePathFor51
@@ -21,101 +26,126 @@ $messages = New-Object System.Collections.Generic.List[string]
 $ok = $false
 $reboot = $false
 
-# Current task layout, then the layouts of the first (unpublished) versions, which are always removed.
-$currentTasks = @(@{ Path = '\QuakeKey\'; Name = 'Hotkey' }, @{ Path = '\QuakeKey\'; Name = 'StartHidden' }, @{ Path = '\QuakeKey\'; Name = 'StartShown' })
-$legacyTasks = @(@{ Path = '\Elevated\'; Name = 'QuakeKey' }, @{ Path = '\'; Name = 'QuakeKey' })
+# Layouts of earlier versions, removed when they belong to this user: v1.0 (\QuakeKey\Hotkey, Start*) and the
+# unpublished versions before it.
+$legacyTasks = @(
+    @{ Path = '\QuakeKey\'; Name = 'Hotkey' }, @{ Path = '\QuakeKey\'; Name = 'StartShown' }, @{ Path = '\QuakeKey\'; Name = 'StartHidden' },
+    @{ Path = '\Elevated\'; Name = 'QuakeKey' }, @{ Path = '\'; Name = 'QuakeKey' })
 
-function Get-QkTask($t) { Get-ScheduledTask -TaskPath $t.Path -TaskName $t.Name -ErrorAction SilentlyContinue }
+function Test-QkTaskOwner($Task, [string]$Sid) {
+    $id = $Task.Principal.UserId
+    if (-not $id) { return $false }   # a group principal; Get-QkUserSid '' would mean "the current user"
+    try { (Get-QkUserSid $id) -eq $Sid } catch { $false }
+}
 
-# %ProgramData% lets every user create files, so the log folder gets its own ACL: SYSTEM and Administrators full
-# control, Users read. The elevated QuakeKey only writes there, and never through a link.
-function Initialize-QkLogDir([string]$Dir) {
-    if (Test-Path -LiteralPath $Dir) {
-        $item = Get-Item -LiteralPath $Dir -Force
-        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-            [System.IO.Directory]::Delete($Dir)   # removes a planted junction/symlink itself, not its target
-            $messages.Add("removed a link that sat at $Dir")
-        }
+function Stop-QkUserProcesses([string]$Sid) {
+    $stopped = 0
+    foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='QuakeKey.exe'")) {
+        # A process that is exiting (the task stop just above) can still be listed and then fail GetOwnerSid.
+        try { $owner = Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid }
+        catch { Write-Verbose "process $($p.ProcessId) exited while being checked"; continue }
+        if ($owner.Sid -eq $Sid) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue; $stopped++ }
     }
-    New-Item -ItemType Directory -Force $Dir | Out-Null
-    $out = & icacls.exe $Dir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' /Q 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "icacls could not secure $Dir`: $out" }
-    $out = & icacls.exe $Dir /setowner '*S-1-5-32-544' /T /Q 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "icacls could not set the owner of $Dir`: $out" }
-    Get-ChildItem -LiteralPath $Dir -Force | Where-Object { $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint } |
-        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force; $messages.Add("removed a link that sat at $($_.FullName)") }
+    $stopped
+}
+
+function Remove-QkTaskFolder([string]$Path) {
+    # Path like \QuakeKey\S-1-...\ or \QuakeKey\ ; the folder is only deleted when empty.
+    $parts = $Path.Trim('\').Split('\')
+    $parent = if ($parts.Count -gt 1) { '\' + ($parts[0..($parts.Count - 2)] -join '\') } else { '\' }
+    try {
+        $svc = New-Object -ComObject Schedule.Service
+        $svc.Connect()
+        $svc.GetFolder($parent).DeleteFolder($parts[-1], 0)
+    }
+    catch { Write-Verbose "task folder $Path not removed: not empty or already gone" }
 }
 
 try {
     if (-not (Test-QkElevated)) { throw 'This step must run elevated.' }
-    $paths = Get-QkPaths
-    $exe = Join-Path $paths.InstallDir 'QuakeKey.exe'
     if (-not $User) { $User = [Security.Principal.WindowsIdentity]::GetCurrent().Name }
+    $sid = Get-QkUserSid $User
+    $paths = Get-QkPaths -Sid $sid
+    $exe = Join-Path $paths.InstallDir 'QuakeKey.exe'
+    $debuggerRecord = Join-Path $paths.InstallDir 'debugger-key.json'
 
-    # Stop every running copy so the exe can be replaced or removed.
-    foreach ($t in $currentTasks + $legacyTasks) { $task = Get-QkTask $t; if ($task) { $task | Stop-ScheduledTask -ErrorAction SilentlyContinue } }
-    Get-Process -Name QuakeKey -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # Stop this user's copies so the exe can be replaced or removed. Other users' QuakeKey keeps running.
+    $mine = @(Get-ScheduledTask -TaskPath $paths.TaskFolder -ErrorAction SilentlyContinue)
+    $legacy = @($legacyTasks | ForEach-Object { Get-ScheduledTask -TaskPath $_.Path -TaskName $_.Name -ErrorAction SilentlyContinue } |
+            Where-Object { Test-QkTaskOwner $_ $sid })
+    foreach ($task in $mine + $legacy) { $task | Stop-ScheduledTask -ErrorAction SilentlyContinue }
+    $stopped = Stop-QkUserProcesses $sid
+    if ($stopped) { $messages.Add("stopped $stopped running QuakeKey process(es) of $User") }
     Start-Sleep -Milliseconds 500
-
-    foreach ($t in $legacyTasks) {
-        if (Get-QkTask $t) { Unregister-ScheduledTask -TaskPath $t.Path -TaskName $t.Name -Confirm:$false; $messages.Add("removed the old task $($t.Path)$($t.Name)") }
+    foreach ($task in $legacy) {
+        Unregister-ScheduledTask -TaskPath $task.TaskPath -TaskName $task.TaskName -Confirm:$false
+        $messages.Add("removed the old task $($task.TaskPath)$($task.TaskName)")
     }
 
     if ($Mode -eq 'Install') {
-        if (-not $Source -or -not (Test-Path -LiteralPath $Source)) { throw "The built QuakeKey.exe was not found at '$Source'." }
+        if (-not $Source -or -not $SourceSha256) { throw 'Install needs -Source and -SourceSha256.' }
         New-Item -ItemType Directory -Force $paths.InstallDir | Out-Null
-        Copy-Item -LiteralPath $Source -Destination $exe -Force
-        $messages.Add("installed $exe")
+        $how = Copy-QkVerifiedFile -Source $Source -Destination $exe -Sha256 $SourceSha256
+        $messages.Add("$exe $how (SHA-256 checked)")
 
-        Initialize-QkLogDir $paths.LogDir
-        $messages.Add("log folder $($paths.LogDir) (administrators write, users read)")
+        foreach ($m in (Initialize-QkLogFolders -Root $paths.LogRoot -Sid $sid)) { $messages.Add($m) }
+        $messages.Add("log folder $($paths.LogDir) (administrators write, $User reads)")
 
         if ($MoveDebuggerKey) {
-            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
-            try {
-                $k = $base.CreateSubKey('SOFTWARE\Microsoft\Windows NT\CurrentVersion\AeDebug')
-                $k.SetValue('UserDebuggerHotKey', $DebuggerBreakVk, [Microsoft.Win32.RegistryValueKind]::DWord)
-                $k.Close()
+            # The first install that moves it records the original value; uninstall puts that back.
+            if (-not (Test-Path -LiteralPath $debuggerRecord)) {
+                $record = [pscustomobject]@{ original = (Get-QkDebuggerKeyValue); set = $DebuggerBreakVk }
+                [IO.File]::WriteAllText($debuggerRecord, ($record | ConvertTo-Json))
             }
-            finally { $base.Close() }
+            Set-QkDebuggerKeyValue $DebuggerBreakVk
             $reboot = $true
             $messages.Add(('moved the debugger break key (UserDebuggerHotKey) to 0x{0:X2}; {1} works after the next reboot' -f $DebuggerBreakVk, $Key))
         }
 
-        $common = @{ AllowStartIfOnBatteries = $true; DontStopIfGoingOnBatteries = $true; Priority = 4 }   # 4 = normal (default 7 is below normal)
-        $hotkeySettings = New-ScheduledTaskSettingsSet @common -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
-            -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
-        Register-ScheduledTask -TaskPath '\QuakeKey\' -TaskName 'Hotkey' -Force `
-            -Action (New-ScheduledTaskAction -Execute $exe -Argument ('--key "' + $Key + '"') -WorkingDirectory $paths.InstallDir) `
-            -Trigger (New-ScheduledTaskTrigger -AtLogOn -User $User) `
-            -Principal (New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Highest) `
-            -Settings $hotkeySettings -Description "QuakeKey: $Key toggles the Windows Terminal quake window (https://github.com/abd3lraouf-studios/QuakeKey)." | Out-Null
-        $messages.Add("registered task \QuakeKey\Hotkey for $User (runs elevated at logon)")
-
-        $launchSettings = New-ScheduledTaskSettingsSet @common -ExecutionTimeLimit (New-TimeSpan -Minutes 1) -MultipleInstances Parallel
-        foreach ($which in 'Shown', 'Hidden') {   # not $mode: PowerShell variables ignore case and $Mode is a parameter
-            Register-ScheduledTask -TaskPath '\QuakeKey\' -TaskName "Start$which" -Force `
-                -Action (New-ScheduledTaskAction -Execute $exe -Argument "--start $($which.ToLower())" -WorkingDirectory $paths.InstallDir) `
-                -Principal (New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Limited) `
-                -Settings $launchSettings -Description "QuakeKey: starts Windows Terminal ($($which.ToLower())) without admin rights." | Out-Null
+        $definitions = New-QkTaskDefinitions -Exe $exe -Key $Key -User $User -WorkingDirectory $paths.InstallDir
+        foreach ($name in $definitions.Keys) {
+            $d = $definitions[$name]
+            $register = @{ TaskPath = $paths.TaskFolder; TaskName = $name; Action = $d.Action; Principal = $d.Principal; Settings = $d.Settings; Description = $d.Description; Force = $true }
+            if ($d.ContainsKey('Trigger')) { $register.Trigger = $d.Trigger }
+            Register-ScheduledTask @register | Out-Null
         }
-        $messages.Add('registered tasks \QuakeKey\StartShown and \QuakeKey\StartHidden (normal privileges)')
+        $messages.Add("registered tasks $($paths.TaskFolder)Hotkey (elevated, at logon, restarted within 5 minutes if it stops), StartShown and StartHidden (normal privileges)")
 
-        Start-ScheduledTask -TaskPath '\QuakeKey\' -TaskName 'Hotkey'
-        $messages.Add('started QuakeKey')
+        try {
+            Start-ScheduledTask -TaskPath $paths.TaskFolder -TaskName 'Hotkey'
+            $messages.Add('started QuakeKey')
+        }
+        catch { $messages.Add("could not start QuakeKey now ($($_.Exception.Message)); it starts at the next sign-in") }
     }
     else {
-        foreach ($t in $currentTasks) {
-            if (Get-QkTask $t) { Unregister-ScheduledTask -TaskPath $t.Path -TaskName $t.Name -Confirm:$false; $messages.Add("removed task $($t.Path)$($t.Name)") }
+        foreach ($task in $mine) {
+            Unregister-ScheduledTask -TaskPath $task.TaskPath -TaskName $task.TaskName -Confirm:$false
+            $messages.Add("removed task $($task.TaskPath)$($task.TaskName)")
         }
-        try {
-            $svc = New-Object -ComObject Schedule.Service
-            $svc.Connect()
-            $svc.GetFolder('\').DeleteFolder('QuakeKey', 0)
+        Remove-QkTaskFolder $paths.TaskFolder
+        if (-not $KeepLogs -and (Test-QkPathExists $paths.LogDir)) { Remove-QkTreeSafely $paths.LogDir; $messages.Add("removed $($paths.LogDir)") }
+
+        $others = @(Get-QkInstalledUserSids | Where-Object { $_ -ne $sid })
+        if ($others.Count) {
+            $messages.Add("kept $($paths.InstallDir): $($others.Count) other user(s) still use QuakeKey")
         }
-        catch { }
-        if (Test-Path -LiteralPath $paths.InstallDir) { Remove-Item -LiteralPath $paths.InstallDir -Recurse -Force; $messages.Add("removed $($paths.InstallDir)") }
-        if (-not $KeepLogs -and (Test-Path -LiteralPath $paths.LogDir)) { Remove-Item -LiteralPath $paths.LogDir -Recurse -Force; $messages.Add("removed $($paths.LogDir)") }
+        else {
+            if (Test-Path -LiteralPath $debuggerRecord) {
+                $record = Get-Content -LiteralPath $debuggerRecord -Raw | ConvertFrom-Json
+                $current = Get-QkDebuggerKeyValue
+                if ($KeepDebuggerKey) { $messages.Add('left the debugger break key where the installer moved it (-KeepDebuggerKey)') }
+                elseif ($current -eq [int]$record.set) {
+                    Set-QkDebuggerKeyValue $record.original
+                    $reboot = $true
+                    $was = if ($null -eq $record.original) { 'not set (F12)' } else { '0x{0:X2}' -f [int]$record.original }
+                    $messages.Add("put the debugger break key back ($was); takes effect after a reboot")
+                }
+                else { $messages.Add('left the debugger break key as it is: it was changed after the install') }
+            }
+            if (Test-QkPathExists $paths.InstallDir) { Remove-QkTreeSafely $paths.InstallDir; $messages.Add("removed $($paths.InstallDir)") }
+            if (-not $KeepLogs -and (Test-QkPathExists $paths.LogRoot)) { Remove-QkTreeSafely $paths.LogRoot; $messages.Add("removed $($paths.LogRoot)") }
+            Remove-QkTaskFolder '\QuakeKey\'
+        }
     }
     $ok = $true
 }
@@ -123,10 +153,13 @@ catch { $messages.Add("ERROR: $($_.Exception.Message)") }
 finally {
     $json = [pscustomobject]@{ ok = $ok; rebootNeeded = $reboot; messages = $messages.ToArray() } | ConvertTo-Json -Depth 4
     try {
-        $fs = [System.IO.File]::Open($ResultFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
-        try { $bytes = (New-Object System.Text.UTF8Encoding $false).GetBytes($json); $fs.Write($bytes, 0, $bytes.Length) }
-        finally { $fs.Close() }
+        $parent = Split-Path $ResultFile
+        if ((Test-QkPathExists $parent) -and -not (Test-QkLink $parent)) {
+            $fs = [System.IO.File]::Open($ResultFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+            try { $bytes = (New-Object System.Text.UTF8Encoding $false).GetBytes($json); $fs.Write($bytes, 0, $bytes.Length) }
+            finally { $fs.Close() }
+        }
     }
-    catch { }
+    catch { Write-Verbose "could not write the result file: $($_.Exception.Message)" }
 }
 if ($ok) { exit 0 } else { exit 1 }

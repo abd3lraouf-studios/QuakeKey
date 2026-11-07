@@ -1,0 +1,5 @@
+// keys in another order and case, with comments and trailing commas, as Terminal accepts them
+{
+    "actions": [ { "command": { "action": "globalSummon", "name": "_quake", }, "id": "User.q", }, ],
+    "keybindings": [ { "id": "User.q", "keys": "Shift+Ctrl+Alt+F24" }, ], /* end */
+}

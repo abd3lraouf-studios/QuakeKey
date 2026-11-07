@@ -5,19 +5,42 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# `shell:` takes literal keywords only; an expression there fails the run before any job starts.
 jobs:
   tests-windows-powershell:
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Run tests (Windows PowerShell 5.1)
         shell: powershell
         run: .\tests\Run-Tests.ps1
 
   tests-powershell-7:
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Run tests (PowerShell 7)
         shell: pwsh
         run: .\tests\Run-Tests.ps1
+
+  lint:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Settings .\PSScriptAnalyzerSettings.psd1
+          $results | Format-Table -AutoSize RuleName, Severity, ScriptName, Line, Message | Out-String -Width 220 | Write-Host
+          if ($results) { throw "PSScriptAnalyzer found $(@($results).Count) problem(s)." }

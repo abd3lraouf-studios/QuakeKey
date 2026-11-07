@@ -1,0 +1,1 @@
+{ "actions": [ { "command": { "action": "quakeMode" }, "keys": [ "ctrl+alt+shift+f24" ] } ] }
